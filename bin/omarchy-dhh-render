@@ -1,0 +1,350 @@
+#!/usr/bin/env node
+"use strict"
+
+// omarchy-dhh-render — render a DHH quote/post as a PNG and copy it to the
+// clipboard. Reads one entry JSON from argv[2], builds an HTML template
+// styled like a real X post for `type: "post"` and `type: "video"` (or a
+// classic shareable quote card for `type: "quote"` and `type: "link"`), renders
+// it with chromium headless, crops the dead canvas
+// with /usr/bin/magick so post PNGs are sized to their content, writes it to
+// ~/Pictures/dhh/<slug>-<id>.png, and copies it to the clipboard with
+// wl-copy --type image/png.
+
+const fs = require("fs")
+const os = require("os")
+const path = require("path")
+const { execFileSync } = require("child_process")
+const shared = require("./shared")
+
+const SCRIPT_ROOT = path.resolve(__dirname, "..")
+const AVATAR_PATH = path.join(SCRIPT_ROOT, "data", "avatar.png")
+// Color DHH portrait used as the circular avatar in the X-post style (the
+// "fake x.com" chrome). avatar.png above stays grayscale — the classic quote
+// card fades it into the black background.
+const X_AVATAR_PATH = path.join(SCRIPT_ROOT, "data", "avatar-x.png")
+const LOGO_PATH = path.join(SCRIPT_ROOT, "data", "company-logo.png")
+// x.com's default avatar (gray circle + person silhouette), used as the
+// offline fallback when a reply/repost context author's remote avatar fails.
+const DEFAULT_AVATAR_PATH = path.join(SCRIPT_ROOT, "data", "avatar-default.png")
+const CHROMIUM = "/usr/bin/chromium"
+const MAGICK = "/usr/bin/magick"
+const WIDTH = 600
+// Chromium screenshots the whole window, so render taller than any entry can
+// be and trim the excess; the real height is the content, not this constant.
+// 1200 CSS px is the render height (WIDTH is 600), tall enough for any post.
+const RENDER_HEIGHT = 1200
+// Retina-sharp output: render at 2x device pixels. The CSS viewport stays
+// WIDTH wide, so the screenshot comes out WIDTH * SCALE device pixels wide; the
+// ImageMagick trim box is in device pixels and scales accordingly.
+const SCALE = 2
+// Quote cards are a fixed 16:9 landscape (WIDTH x 9/16, rounded up to 338) so
+// the 2x screenshot is 1200x676. The body is the full black card with no
+// surrounding dead canvas, so quotes skip trimToContent.
+const QUOTE_HEIGHT = 338
+
+// search.js and format.js are Qt-free scripts with no module.exports, so they
+// are loaded via shared.loadScript into a vm sandbox and their top-level
+// functions become sandbox properties. slugify comes from search.js; the
+// formatting helpers (escapeHtml, formatDate, formatCount, engagementCounts)
+// come from format.js.
+const Search = shared.loadScript(path.join(SCRIPT_ROOT, "search.js"))
+const Fmt = shared.loadScript(path.join(SCRIPT_ROOT, "format.js"))
+
+function dataUri(file, mime) {
+  return "data:" + mime + ";base64," + fs.readFileSync(file).toString("base64")
+}
+
+// Action and badge icons are read from data/icon-*.svg at render time (the
+// same files the panel loads via Qt.resolvedUrl) and inlined as data URIs, so
+// the rendered glyphs can never drift from the panel again. The SVG files bake
+// in their own fill color (#71767B resting, #1D9BF0 verified seal), matching
+// the panel's hover/resting palette.
+// The Grok AI head icon is also loaded from data/icon-grok.svg via iconDataUri.
+function iconDataUri(name) {
+  return dataUri(path.join(SCRIPT_ROOT, "data", "icon-" + name + ".svg"), "image/svg+xml")
+}
+
+function buildHtml(entry) {
+  const text = Fmt.escapeHtml(Search.stripReplyMention(entry.text, entry.context && entry.context.handle))
+  const date = Fmt.formatDate(entry.date)
+  const avatar = dataUri(X_AVATAR_PATH, "image/png")
+  const logo = dataUri(LOGO_PATH, "image/png")
+
+  // Outer post chrome, shared by both types: circular avatar, then a single
+  // author line (bold name, blue verified badge, 37signals logo, muted handle
+  // with an X-style relative timestamp when a date is present).
+  const head = `
+      <div class="post-head">
+        <img class="avatar" src="${avatar}" alt="">
+        <div class="post-author">
+          <span class="name">DHH</span>
+          <img class="badge" src="${iconDataUri('verified')}" alt="">
+          <img class="logo" src="${logo}" alt="">
+          <span class="handle">@dhh${date ? " · " + date : ""}</span>
+        </div>
+        <div class="head-icons">
+          <img class="head-icon" src="${iconDataUri('grok')}" alt="" width="18" height="18" />
+          <img class="head-icon" src="${iconDataUri('dots')}" alt="">
+        </div>
+      </div>`
+
+  // Body keyed off `kind` (the sole render discriminator). `main()` routes
+  // non-x.com quotes and links to buildQuoteHtml, so this sees posts, videos,
+  // x.com-sourced quotes, and reply/repost entries: replies and reposts render
+  // DHH's body plus the original post as a quoted card; the rest render only
+  // the body.
+  // Quoted-card body: the original post's text when present, else DHH's own
+  // words for a bare repost whose context omits text (reply/repost share this).
+  const quoteText = Fmt.escapeHtml(
+    entry.context && entry.context.text
+      ? entry.context.text
+      : (entry.kind === "repost" ? entry.text : "")
+  )
+  // Reply/repost quoted card author avatar: unavatar.io resolves the current
+  // avatar for the bare handle (leading '@' stripped). Omitted entirely when
+  // there is no handle so the name+handle still render without a broken image.
+  const bareHandle = (entry.context && entry.context.handle ? entry.context.handle : "").replace(/^@/, "")
+  const contextDate = entry.context && entry.context.date ? Fmt.formatDate(entry.context.date) : ""
+  const quoteAvatar = bareHandle
+    ? `<img class="quote-avatar" src="https://unavatar.io/x/${Fmt.escapeHtml(bareHandle)}" onerror="this.onerror=null;this.src='${dataUri(DEFAULT_AVATAR_PATH, "image/png")}'" alt="">`
+    : ""
+  const body = entry.kind === "reply" || entry.kind === "repost"
+    ? `
+      <div class="post-body">${text}</div>
+      <div class="quote-container">
+        <div class="quote-author">
+          ${quoteAvatar}
+          <span class="quote-name">${Fmt.escapeHtml(entry.context && entry.context.author ? entry.context.author : "")}</span>
+          <span class="quote-handle">${Fmt.escapeHtml(entry.context && entry.context.handle ? entry.context.handle : "")}${contextDate ? " · " + Fmt.escapeHtml(contextDate) : ""}</span>
+        </div>
+        <div class="quote-text">${quoteText}</div>
+      </div>`
+    : `
+      <div class="post-body">${text}</div>`
+
+  const actions = (() => {
+    const c = Fmt.engagementCounts(entry.text)
+    const metric = (icon, count) => `
+        <span class="action"><img class="action-icon" src="${iconDataUri(icon)}" alt=""/><span class="count">${count}</span></span>`
+    return `
+      <div class="action-row">
+${metric("reply", Fmt.formatCount(c.reply))}
+${metric("repost", Fmt.formatCount(c.repost))}
+${metric("like", Fmt.formatCount(c.like))}
+${metric("views", Fmt.formatCount(c.views))}
+        <div class="action-trail">
+        <img class="action-icon" src="${iconDataUri('bookmark')}" alt=""/>
+        <img class="action-icon" src="${iconDataUri('share')}" alt=""/>
+        </div>
+      </div>`
+  })()
+
+  return `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+  body { margin: 0; padding: 0; width: ${WIDTH}px; background: #000000; color: #E7E9EA;
+         font-family: "Noto Sans", "Inter", "Segoe UI", Roboto, Arial, sans-serif;
+         -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+  .post { display: flex; flex-direction: column; padding: 12px 16px; }
+  .post-head { display: flex; align-items: center; }
+  .avatar { width: 40px; height: 40px; border-radius: 50%; object-fit: cover; display: block;
+            flex-shrink: 0; margin-right: 12px; }
+  .post-author { display: flex; align-items: center; gap: 2px; min-width: 0; }
+  .name { font-weight: 700; font-size: 15px; color: #E7E9EA; white-space: nowrap; }
+  .badge { width: 16px; height: 16px; flex-shrink: 0; fill: #1D9BF0; }
+  .logo { width: 12px; height: 12px; flex-shrink: 0; object-fit: contain; border: 1px solid #71767B; box-sizing: border-box; }
+  .handle { font-size: 15px; font-weight: 400; color: #71767B; white-space: nowrap; }
+  .head-icons { display: flex; align-items: center; gap: 4px; margin-left: auto; flex-shrink: 0; }
+  .head-icon { width: 18px; height: 18px; flex-shrink: 0; fill: #71767B; }
+  .post-body { margin-top: 6px; margin-left: 52px; font-size: 15px; line-height: 1.33; font-weight: 400; color: #E7E9EA;
+               white-space: pre-wrap; }
+  .quote-container { margin-top: 6px; margin-left: 52px; border: 1px solid #2F3336; border-radius: 16px; padding: 12px; }
+  .quote-author { display: flex; align-items: center; gap: 4px; }
+  .quote-avatar { width: 16px; height: 16px; border-radius: 50%; object-fit: cover; flex-shrink: 0; }
+  .quote-name { font-weight: 700; font-size: 15px; color: #E7E9EA; }
+  .quote-handle { font-size: 15px; font-weight: 400; color: #71767B; }
+  .quote-text { margin-top: 4px; font-size: 15px; line-height: 1.33; font-weight: 400; color: #E7E9EA; white-space: pre-wrap; }
+  .action-row { display: flex; justify-content: space-between; align-items: center; margin-left: 52px; margin-top: 12px; }
+  .action-trail { display: flex; align-items: center; gap: 8px; }
+  .action { display: inline-flex; align-items: center; gap: 4px; flex: 1 1 0%; }
+  .action-icon { width: 18.75px; height: 18.75px; fill: #71767B; }
+  .count { font-size: 13px; font-weight: 400; color: #71767B; white-space: nowrap; }
+</style></head><body>
+    <div class="post">
+      ${head}
+      ${body}
+      ${actions}
+    </div>
+  </body></html>`
+}
+
+// Classic shareable quote card for non-x.com `type: "quote"` and `type: "link"`
+// entries: a full-bleed black canvas (no border, no chrome) split into a left
+// text column — large white serif
+// quote in curly quotes with an italic serif attribution below — and a right
+// column holding the grayscale DHH portrait, whose left edge fades to
+// transparent via a CSS mask so it melts into the black background.
+function buildQuoteHtml(entry) {
+  const text = Fmt.escapeHtml(entry.text)
+  const avatar = dataUri(AVATAR_PATH, "image/png")
+  const len = entry.text.length
+  // Shrink the type as the quote grows so the longest entry (177 chars) still
+  // fits the 338px-tall card without clipping.
+  const fontSize = len <= 50 ? 30 : len <= 90 ? 26 : len <= 130 ? 23 : 20
+  const attrSize = Math.round(fontSize * 0.55)
+
+  return `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+  html, body { margin: 0; padding: 0; width: ${WIDTH}px; height: ${QUOTE_HEIGHT}px;
+               background: #000000; overflow: hidden;
+               -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+  .card { display: flex; width: 100%; height: 100%; }
+  .text-side { flex: 0 0 58%; display: flex; flex-direction: column; justify-content: center;
+               padding: 0 24px 0 48px; box-sizing: border-box; }
+  .quote { color: #FFFFFF; font-family: Georgia, "DejaVu Serif", "Times New Roman", serif;
+           font-size: ${fontSize}px; line-height: 1.35; font-weight: 400; }
+  .attribution { color: #FFFFFF; font-family: Georgia, "DejaVu Serif", "Times New Roman", serif;
+                 font-style: italic; font-size: ${attrSize}px; margin-top: 20px; }
+  .portrait-side { flex: 0 0 42%; position: relative; }
+  .portrait { position: absolute; top: 0; right: 0; height: 100%; width: 100%;
+              object-fit: cover; object-position: 30% 50%;
+              -webkit-mask-image: linear-gradient(to right, transparent 0%, black 32%),
+                                  linear-gradient(to bottom, black 55%, transparent 100%);
+              -webkit-mask-composite: source-in;
+              mask-image: linear-gradient(to right, transparent 0%, black 32%),
+                          linear-gradient(to bottom, black 55%, transparent 100%);
+              mask-composite: intersect; }
+</style></head><body>
+  <div class="card">
+    <div class="text-side">
+      <div class="quote">&ldquo;${text}&rdquo;</div>
+      <div class="attribution">David Heinemeier Hansson</div>
+    </div>
+    <div class="portrait-side">
+      <img class="portrait" src="${avatar}" alt="">
+    </div>
+  </div>
+</body></html>`
+}
+
+// Trims the raw render down to the post. The template renders the post tall on
+// a dead black canvas with its own 12px/16px CSS padding and no trailing
+// divider, so only the dead canvas below the content is cropped: `-trim`
+// reports the content bounding box (`%@` = WxH+X+Y) and we re-crop to the full
+// rendered width from y=0 down to the box's bottom edge. That keeps the
+// horizontal extent edge-to-edge (no uniform frame), keeps the top padding
+// intact, and ends the image cleanly at the post content with no divider row.
+// On any magick failure or a blank render (uniform black), falls back to the
+// raw render so the user still gets a full PNG rather than nothing.
+function trimToContent(rawPath, outPath) {
+  const fullWidth = WIDTH * SCALE
+  let box = ""
+  try {
+    box = execFileSync(MAGICK, [
+      rawPath, "-format", "%@", "info:"
+    ], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim()
+  } catch (e) {
+    box = ""
+  }
+  const m = /^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$/.exec(box)
+  if (!m) {
+    fs.copyFileSync(rawPath, outPath)
+    fs.unlinkSync(rawPath)
+    return
+  }
+  const h = parseInt(m[2], 10)
+  const y = parseInt(m[4], 10)
+  const bottom = y + h
+  if (h <= 0 || bottom <= 0) {
+    if (fs.existsSync(outPath)) fs.unlinkSync(outPath)
+    fs.copyFileSync(rawPath, outPath)
+    fs.unlinkSync(rawPath)
+    return
+  }
+  try {
+    execFileSync(MAGICK, [
+      rawPath, "-crop", fullWidth + "x" + bottom + "+0+0", "+repage", outPath
+    ], { stdio: ["ignore", "ignore", "ignore"] })
+  } catch (e) {
+    if (fs.existsSync(outPath)) fs.unlinkSync(outPath)
+    fs.copyFileSync(rawPath, outPath)
+    fs.unlinkSync(rawPath)
+    return
+  }
+  fs.unlinkSync(rawPath)
+}
+
+function main() {
+  const entry = JSON.parse(process.argv[2])
+  if (!entry || !entry.text || !entry.type) {
+    console.error("invalid entry: expected { text, type, source, date? }")
+    process.exit(1)
+  }
+  const slug = Search.slugify(entry.text) || "dhh"
+  const outDir = path.join(os.homedir(), "Pictures", "dhh")
+  fs.mkdirSync(outDir, { recursive: true })
+  // id is always derived from the text (never trusted from the dataset, which
+  // could carry a malformed ../ path), so the output filename cannot traverse.
+  const id = Search.entryId(entry.text, shared.sha256Hex)
+  const outPath = path.join(outDir, slug + "-" + id + ".png")
+
+  // Already-rendered entry: return the existing PNG path immediately so a
+  // second render of the same entry never re-runs chromium. This is the same
+  // stdout line the panel keys off below.
+  if (fs.existsSync(outPath)) {
+    console.log(outPath)
+    process.exit(0)
+  }
+
+  const isXSource = /x\.com|twitter\.com/.test(entry.source || "")
+  const isQuote = (entry.type === "quote" && !isXSource) || entry.type === "link"
+  const html = isQuote ? buildQuoteHtml(entry) : buildHtml(entry)
+  // Temp dir is created atomically (mkdtempSync), so the intermediate paths are
+  // unpredictable and cannot collide with another render's files.
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dhh-render-"))
+  const tmpHtml = path.join(tmpDir, "render.html")
+  const tmpRaw = path.join(tmpDir, "render.png")
+  fs.writeFileSync(tmpHtml, html)
+
+  try {
+    // Posts render tall then trim to content; quotes render at their fixed
+    // 16:9 card size and need no trim (a black card on black yields no trim
+    // contrast, and the window already matches the card exactly).
+    const windowSize = isQuote
+      ? WIDTH + "," + QUOTE_HEIGHT
+      : WIDTH + "," + RENDER_HEIGHT
+    execFileSync(CHROMIUM, [
+      "--headless", "--disable-gpu", "--hide-scrollbars",
+      "--force-device-scale-factor=" + SCALE,
+      "--screenshot=" + tmpRaw,
+      "--window-size=" + windowSize,
+      "file://" + tmpHtml
+    ], { stdio: "ignore" })
+    if (isQuote) {
+      // /tmp is a tmpfs here, so rename across devices fails with EXDEV; copy
+      // instead. The tmpDir temp files are still removed in the finally block.
+      fs.copyFileSync(tmpRaw, outPath)
+    } else {
+      trimToContent(tmpRaw, outPath)
+    }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  }
+
+  // Print the PNG path as soon as it is written so the panel can show the
+  // preview even if the clipboard copy below hangs or fails. This is the
+  // script's only stdout line; the panel's stdout reader keys off it.
+  console.log(outPath)
+
+  // wl-copy forks a background daemon to keep serving the clipboard; that
+  // daemon inherits the stdout/stderr pipes and would otherwise hold them open,
+  // blocking execFileSync forever. Ignore those two streams (stdin stays piped
+  // so the PNG bytes flow through). A clipboard failure must not abort the
+  // script or suppress the path above: the PNG is already saved.
+  try {
+    execFileSync("wl-copy", ["--type", "image/png"], { input: fs.readFileSync(outPath), stdio: ["pipe", "ignore", "ignore"] })
+  } catch (e) {
+    console.error("wl-copy failed: " + (e && e.message ? e.message : e))
+  }
+}
+
+main()

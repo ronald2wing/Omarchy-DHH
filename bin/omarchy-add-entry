@@ -1,0 +1,97 @@
+#!/usr/bin/env node
+"use strict"
+const path = require("path")
+const shared = require("./shared")
+
+// search.js is Qt-free with no module.exports, so it's loaded via
+// shared.loadScript (a vm sandbox) and its top-level functions become Search
+// properties.
+const Search = shared.loadScript(path.join(__dirname, "..", "search.js"))
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
+
+function fail(msg) {
+  process.stderr.write(msg + "\n")
+  process.exit(1)
+}
+
+const argv = process.argv.slice(2)
+
+const VALUE_FLAGS = ["type", "text", "source", "date", "title", "domain", "kind", "context-author", "context-handle", "context-text", "context-date"]
+const flags = {}
+for (let i = 0; i < argv.length; i++) {
+  const arg = argv[i]
+  if (arg.startsWith("--") && VALUE_FLAGS.indexOf(arg.slice(2)) !== -1) {
+    if (i + 1 >= argv.length) {
+      fail("missing value for " + arg)
+    }
+    flags[arg.slice(2)] = argv[i + 1]
+    i++
+  }
+}
+
+// Reject unknown flags (silently-dropped flags hide doc drift bugs).
+for (let i = 0; i < argv.length; i++) {
+  if (argv[i].startsWith("--") && VALUE_FLAGS.indexOf(argv[i].slice(2)) === -1) {
+    fail("unknown flag: " + argv[i])
+  }
+}
+
+const type = flags.type
+const text = flags.text
+const source = flags.source
+const date = flags.date
+
+const TYPES = ["post", "quote", "link", "video"]
+if (TYPES.indexOf(type) === -1) {
+  fail("--type must be one of: post, quote, link, video")
+}
+if (typeof text !== "string" || text.trim() === "") {
+  fail("--text is required and must be non-empty")
+}
+if (typeof source !== "string" || source.trim() === "") {
+  fail("--source is required and must be non-empty")
+}
+if (date !== undefined && !DATE_RE.test(date)) {
+  fail("--date must be YYYY-MM-DD")
+}
+if (flags.kind !== undefined && flags.kind !== "reply" && flags.kind !== "repost") {
+  fail("--kind must be reply or repost")
+}
+if (flags.kind !== undefined && type !== "post") {
+  fail("--kind is only valid for type post")
+}
+
+const id = Search.entryId(text, shared.sha256Hex)
+
+const entry = { id, type, text, source }
+if (date !== undefined) {
+  entry.date = date
+}
+
+if (type === "link") {
+  if (typeof flags.title !== "string" || flags.title.trim() === "") {
+    fail("--title is required for type link")
+  }
+  if (typeof flags.domain !== "string" || flags.domain.trim() === "") {
+    fail("--domain is required for type link")
+  }
+  entry.title = flags.title
+  entry.domain = flags.domain
+} else if (flags.kind !== undefined) {
+  if (typeof flags["context-author"] !== "string" || flags["context-author"].trim() === "") {
+    fail("--context-author is required when --kind is set")
+  }
+  if (typeof flags["context-handle"] !== "string" || flags["context-handle"].trim() === "") {
+    fail("--context-handle is required when --kind is set")
+  }
+  entry.kind = flags.kind
+  entry.context = { author: flags["context-author"], handle: flags["context-handle"] }
+  if (flags["context-text"] !== undefined) entry.context.text = flags["context-text"]
+  if (flags["context-date"] !== undefined) {
+    if (!DATE_RE.test(flags["context-date"])) fail("--context-date must be YYYY-MM-DD")
+    entry.context.date = flags["context-date"]
+  }
+}
+
+process.stdout.write(JSON.stringify(entry) + "\n")

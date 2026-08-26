@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "dhh",
+  "name": "DHH",
+  "version": "1.0.0",
+  "author": "ronald2wing",
+  "license": "UNLICENSED",
+  "description": "Search David Heinemeier Hansson's (@dhh) public quotes and X posts, copy the text, or render a shareable image.",
+  "keywords": ["dhh", "quotes", "x", "rails", "basecamp", "37signals", "reference"],
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "DHH",
+    "description": "Search DHH quotes and X posts, copy text, or render an image",
+    "category": "Reference",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
