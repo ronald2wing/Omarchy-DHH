@@ -1,0 +1,450 @@
+#!/usr/bin/env ruby
+
+# omarchy-dhh-render — render a DHH quote/post as a PNG and copy it to the
+# clipboard. Reads one entry JSON from ARGV[0], builds an HTML template styled
+# like a real X post for `type: "post"`, `type: "video"`, and x.com-sourced
+# quotes (or a classic shareable quote card for non-x.com `type: "quote"` and
+# `type: "link"` entries), renders it with
+# chromium headless, crops the dead canvas with /usr/bin/magick so post PNGs are
+# sized to their content, writes it to ~/Pictures/dhh/<slug>-<id>.png, and
+# copies it to the clipboard with wl-copy --type image/png.
+#
+# Ruby port of the original Node script. The HTML templates
+# are transcribed byte-for-byte so rendered output is identical.
+
+require 'json'
+require 'open3'
+require 'fileutils'
+require 'tmpdir'
+require 'base64'
+require 'uri'
+require_relative 'dhh_helpers'
+
+SCRIPT_ROOT = File.expand_path('..', __dir__)
+AVATAR_PATH = File.join(SCRIPT_ROOT, 'data', 'avatar.png')
+# Color DHH portrait used as the circular avatar in the X-post style (the
+# "fake x.com" chrome). avatar.png above stays grayscale — the classic quote
+# card fades it into the black background.
+X_AVATAR_PATH = File.join(SCRIPT_ROOT, 'data', 'avatar-x.png')
+LOGO_PATH = File.join(SCRIPT_ROOT, 'data', 'company-logo.png')
+# x.com's default avatar (gray circle + person silhouette), used as the offline
+# fallback when a reply/repost context author's remote avatar fails.
+DEFAULT_AVATAR_PATH = File.join(SCRIPT_ROOT, 'data', 'avatar-default.png')
+CHROMIUM = '/usr/bin/chromium'
+MAGICK = '/usr/bin/magick'
+WIDTH = 600
+# Chromium screenshots the whole window, so render taller than any entry can
+# be and trim the excess; the real height is the content, not this constant.
+RENDER_HEIGHT = 1200
+# Retina-sharp output: render at 2x device pixels. The CSS viewport stays
+# WIDTH wide, so the screenshot comes out WIDTH * SCALE device pixels wide; the
+# ImageMagick trim box is in device pixels and scales accordingly.
+SCALE = 2
+# Quote cards are a fixed 16:9 landscape (WIDTH x 9/16, rounded up to 338) so
+# the 2x screenshot is 1200x676. The body is the full black card with no
+# surrounding dead canvas, so quotes skip trim_to_content.
+QUOTE_HEIGHT = 338
+
+def data_uri(file, mime)
+  "data:#{mime};base64,#{Base64.strict_encode64(File.binread(file))}"
+end
+
+# Action and badge icons are read from data/icon-*.svg at render time (the
+# same files the panel loads via Qt.resolvedUrl) and inlined as data URIs, so
+# the rendered glyphs can never drift from the panel again.
+def icon_data_uri(name)
+  data_uri(File.join(SCRIPT_ROOT, 'data', "icon-#{name}.svg"), 'image/svg+xml')
+end
+
+def build_post_html(entry)
+  # Coerce at the JSON boundary: text and the context strings can be any type,
+  # and a malformed context need not be a Hash. Valid entries stay byte-identical.
+  text_value = entry['text'].to_s
+  context = entry['context'].is_a?(Hash) ? entry['context'] : {}
+  context_author = context['author'].to_s
+  handle = context['handle'].to_s
+  text = DHHHelpers.escape_html(
+    DHHHelpers.strip_leading_mentions(text_value, handle)
+  )
+  date = DHHHelpers.format_date(entry['date'])
+  avatar = data_uri(X_AVATAR_PATH, 'image/png')
+  logo = data_uri(LOGO_PATH, 'image/png')
+
+  is_repost = entry['kind'] == 'repost'
+
+  # Context author's bare handle (leading '@' stripped) and formatted date,
+  # shared by the reply quote card and the repost head. unavatar.io resolves
+  # the current avatar from the bare handle.
+  bare_handle = handle.sub(/\A@/, '')
+  # Percent-encode the handle to match JS encodeURIComponent (space -> %20, not
+  # '+'), so the panel's avatar URL and the rendered PNG stay in sync.
+  encoded_handle = URI.encode_uri_component(bare_handle)
+  context_date = context['date'] ? DHHHelpers.format_date(context['date']) : ''
+  # Context author's X verified state; absent/false hides their badge (the
+  # reply/quote quote-card badge and the repost head badge). DHH's own badge is
+  # unconditional.
+  context_verified = context['verified'] == true
+  # Context author's seal variant from `verified_type`: organization -> gold,
+  # government -> grey, individual/absent -> blue. Gated by context_verified.
+  context_badge_name = case context['verified_type']
+    when 'organization' then 'verified-gold'
+    when 'government' then 'verified-grey'
+    else 'verified'
+    end
+  # Reply quoted-card avatar (16px); omitted entirely when there is no handle
+  # so the name+handle still render without a broken image.
+  quote_avatar = bare_handle.empty? ? '' :
+    "<img class=\"quote-avatar\" src=\"https://unavatar.io/x/#{DHHHelpers.escape_html(encoded_handle)}\" onerror=\"this.onerror=null;this.src='#{data_uri(DEFAULT_AVATAR_PATH, 'image/png')}'\" alt=\"\">"
+
+  # Outer post chrome: circular avatar, then a single author line (bold name,
+  # blue verified badge, 37signals logo, muted handle with an X-style relative
+  # timestamp when a date is present). A repost represents the ORIGINAL post,
+  # so the head swaps DHH's portrait for the context author's unavatar.io
+  # avatar (default-avatar fallback on error) and the context name/handle, and
+  # drops the 37signals logo; its verified badge follows context.verified.
+  head_avatar = if is_repost
+    "<img class=\"avatar\" src=\"https://unavatar.io/x/#{DHHHelpers.escape_html(encoded_handle)}\" onerror=\"this.onerror=null;this.src='#{data_uri(DEFAULT_AVATAR_PATH, 'image/png')}'\" alt=\"\">"
+  else
+    "<img class=\"avatar\" src=\"#{avatar}\" alt=\"\">"
+  end
+  head_name = is_repost ? DHHHelpers.escape_html(context_author) : 'DHH'
+  head_logo = is_repost ? '' : "<img class=\"logo\" src=\"#{logo}\" alt=\"\">"
+  # Non-repost head is DHH (always verified); a repost head is the original
+  # author, so their badge is gated on context.verified and takes their type.
+  head_badge = if is_repost
+    context_verified ? "<img class=\"badge\" src=\"#{icon_data_uri(context_badge_name)}\" alt=\"\">" : ''
+  else
+    "<img class=\"badge\" src=\"#{icon_data_uri('verified')}\" alt=\"\">"
+  end
+  head_handle = if is_repost
+    DHHHelpers.escape_html(handle) +
+      (context_date.empty? ? '' : " · " + DHHHelpers.escape_html(context_date))
+  else
+    "@dhh#{date.empty? ? '' : " · " + date}"
+  end
+
+  # Author line: bold name, verified badge, 37signals logo, muted handle. It is
+  # the first child of .post-main, so it top-aligns with the avatar (the plugin
+  # does not vertically center the author against the avatar).
+  author = "
+        <div class=\"post-head\">
+          <div class=\"post-author\">
+            <span class=\"name\">#{head_name}</span>
+            #{head_badge}
+            #{head_logo}
+            <span class=\"handle\">#{head_handle}</span>
+          </div>
+          <div class=\"head-icons\">
+            <img class=\"head-icon head-icon-grok\" src=\"#{icon_data_uri('grok')}\" alt=\"\" />
+            <img class=\"head-icon\" src=\"#{icon_data_uri('dots')}\" alt=\"\">
+          </div>
+        </div>"
+
+  # Body keyed off `kind` (the sole render discriminator). main routes
+  # non-x.com quotes and links to build_quote_html, so this sees posts, videos,
+  # x.com-sourced quotes, and reply/repost/quote entries. A reply or quote
+  # renders DHH's body plus the original post as a bordered quoted card; a
+  # repost renders only the ORIGINAL author's body (the repost header + head
+  # above already credit them); the rest render only DHH's body.
+  ctx_text = context['text'].to_s
+  quote_text = DHHHelpers.escape_html(ctx_text)
+  # Quoted-card badge for the context author; gated on context.verified.
+  quote_badge = context_verified ? "<img class=\"quote-badge\" src=\"#{icon_data_uri(context_badge_name)}\" alt=\"\">" : ''
+  # Repost body = the original post's text when present, else the reposted
+  # author's words (`text`) for a bare repost whose context omits text, with any
+  # leading reply mention stripped (mirrors Panel.qml repostBodyHtml()).
+  repost_text = DHHHelpers.escape_html(
+    DHHHelpers.strip_leading_mentions(ctx_text.empty? ? text_value : ctx_text, handle)
+  )
+
+  body = if entry['kind'] == 'reply' || entry['kind'] == 'quote'
+    "
+      <div class=\"post-body\">#{text}</div>
+      <div class=\"quote-container\">
+        <div class=\"quote-author\">
+          #{quote_avatar}
+          <span class=\"quote-name\">#{DHHHelpers.escape_html(context_author)}</span>
+          #{quote_badge}
+          <span class=\"quote-handle\">#{DHHHelpers.escape_html(handle)}#{context_date.empty? ? '' : " · " + DHHHelpers.escape_html(context_date)}</span>
+        </div>
+        <div class=\"quote-text\">#{quote_text}</div>
+      </div>"
+  elsif is_repost
+    "
+      <div class=\"post-body\">#{repost_text}</div>"
+  else
+    "
+      <div class=\"post-body\">#{text}</div>"
+  end
+
+  counts = DHHHelpers.decorative_engagement_counts(entry['text'])
+  metric = lambda do |icon, count|
+    "
+        <span class=\"action\"><img class=\"action-icon\" src=\"#{icon_data_uri(icon)}\" alt=\"\"/><span class=\"count\">#{count}</span></span>"
+  end
+  actions = "
+      <div class=\"action-row\">
+#{metric.call('reply', DHHHelpers.format_engagement_count(counts[:reply]))}
+#{metric.call('repost', DHHHelpers.format_engagement_count(counts[:repost]))}
+#{metric.call('like', DHHHelpers.format_engagement_count(counts[:like]))}
+#{metric.call('views', DHHHelpers.format_engagement_count(counts[:views]))}
+        <div class=\"action-trail\">
+        <img class=\"action-icon\" src=\"#{icon_data_uri('bookmark')}\" alt=\"\"/>
+        <img class=\"action-icon\" src=\"#{icon_data_uri('share')}\" alt=\"\"/>
+        </div>
+      </div>"
+
+  # Repost header row, rendered above the card the way X labels a repost in a
+  # timeline: the repost glyph + a bold muted "DHH reposted" label.
+  repost_header = is_repost ? "
+      <div class=\"repost-header\">
+        <img class=\"repost-icon\" src=\"#{icon_data_uri('repost')}\" alt=\"\">
+        <span class=\"repost-label\">DHH reposted</span>
+      </div>" : ''
+
+  "<!DOCTYPE html>
+<html><head><meta charset=\"utf-8\"><style>
+  body { margin: 0; padding: 0; width: #{WIDTH}px; background: #000000; color: #E7E9EA;
+         font-family: \"Noto Sans\", \"Inter\", \"Segoe UI\", Roboto, Arial, sans-serif;
+         -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+  .post { display: flex; flex-direction: column; padding: 6px 16px; }
+  /* Two-column row mirroring the plugin's PostCard: avatar fixed at 40px,
+     content column takes the rest. flex-start keeps the author line top-aligned
+     with the avatar instead of vertically centered. */
+  .post-row { display: flex; align-items: flex-start; }
+  .post-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+  .post-head { display: flex; align-items: center; line-height: 20px; padding-top: 1px; }
+  .avatar { width: 40px; height: 40px; border-radius: 50%; object-fit: cover; display: block;
+            flex-shrink: 0; margin-right: 12px; }
+  .post-author { display: flex; align-items: center; gap: 2px; min-width: 0; }
+  .name { font-weight: 700; font-size: 15px; color: #E7E9EA; white-space: nowrap; }
+  .badge { width: 18px; height: 18px; flex-shrink: 0; fill: #1D9BF0; }
+  .logo { width: 14px; height: 14px; flex-shrink: 0; object-fit: contain; border: 1px solid #71767B; box-sizing: border-box; }
+  .handle { font-size: 15px; font-weight: 400; color: #71767B; white-space: nowrap; }
+  .head-icons { display: flex; align-items: center; gap: 8.75px; margin-left: auto; flex-shrink: 0; }
+  .head-icon { width: 18px; height: 18px; flex-shrink: 0; fill: #71767B; }
+  /* The Grok mark's viewBox is 33x32 (non-square); height:18px + width:auto
+     preserves its intrinsic ratio instead of the ~3% vertical stretch a forced
+     18x18 would cause. Dots stays square via the .head-icon rule above. */
+  .head-icon-grok { width: auto; }
+  /* Repost header indent: contentIndent (52) - glyph (16) - gap (3) - 4 = 29px,
+     so the DHH reposted label lands in the author-name column (the 52px
+     .post-body indent). Mirrors Panel.qml's repost header left margin. */
+  .repost-header { display: flex; align-items: center; gap: 3px; margin-left: 29px; margin-bottom: 4px; }
+  .repost-icon { width: 16px; height: 16px; flex-shrink: 0; fill: #71767B; }
+  .repost-label { font-size: 13px; font-weight: 700; color: #71767B; white-space: nowrap; }
+  .post-body { margin-top: 4.5px; font-size: 15px; line-height: 20px; font-weight: 400; color: #E7E9EA;
+               white-space: pre-wrap; }
+  .quote-container { margin-top: 7px; border: 1px solid #2F3336; border-radius: 16px; padding: 12px; }
+  .quote-author { display: flex; align-items: center; gap: 3px; }
+  .quote-avatar { width: 20px; height: 20px; border-radius: 50%; object-fit: cover; flex-shrink: 0; }
+  .quote-badge { width: 14px; height: 14px; flex-shrink: 0; fill: #1D9BF0; }
+  .quote-name { font-weight: 700; font-size: 15px; color: #E7E9EA; }
+  .quote-handle { font-size: 15px; font-weight: 400; color: #71767B; }
+  .quote-text { margin-top: 2px; font-size: 15px; line-height: 20px; font-weight: 400; color: #E7E9EA; white-space: pre-wrap; }
+  .action-row { display: flex; justify-content: space-between; align-items: center; margin-top: 12.4px; }
+  .action-trail { display: flex; align-items: center; gap: 8px; }
+  .action { display: inline-flex; align-items: center; gap: 4px; flex: 1 1 0%; }
+  .action-icon { width: 18.75px; height: 18.75px; fill: #71767B; }
+  .count { font-size: 13px; font-weight: 400; color: #71767B; white-space: nowrap; }
+</style></head><body>
+    <div class=\"post\">
+      #{repost_header}
+      <div class=\"post-row\">
+        #{head_avatar}
+        <div class=\"post-main\">
+          #{author}
+          #{body}
+          #{actions}
+        </div>
+      </div>
+    </div>
+  </body></html>"
+end
+
+# Classic shareable quote card for non-x.com `type: "quote"` and `type: "link"`
+# entries: a full-bleed black canvas split into a left text column — large white
+# serif quote in curly quotes with an italic serif attribution below — and a
+# right column holding the grayscale DHH portrait, whose left edge fades to
+# transparent via a CSS mask so it melts into the black background.
+def build_quote_html(entry)
+  text = DHHHelpers.escape_html(entry['text'])
+  avatar = data_uri(AVATAR_PATH, 'image/png')
+  # UTF-16 code-unit length (matches JS String#length) so the longest entry
+  # still fits the 338px-tall card without clipping.
+  len = entry['text'].to_s.encode('UTF-16LE').bytesize / 2
+  font_size = len <= 50 ? 30 : len <= 90 ? 26 : len <= 130 ? 23 : 20
+  attr_size = (font_size * 0.55).round
+
+  "<!DOCTYPE html>
+<html><head><meta charset=\"utf-8\"><style>
+  html, body { margin: 0; padding: 0; width: #{WIDTH}px; height: #{QUOTE_HEIGHT}px;
+               background: #000000; overflow: hidden;
+               -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+  .card { display: flex; width: 100%; height: 100%; }
+  .text-side { flex: 0 0 58%; display: flex; flex-direction: column; justify-content: center;
+               padding: 0 24px 0 48px; box-sizing: border-box; }
+  .quote { color: #FFFFFF; font-family: Georgia, \"DejaVu Serif\", \"Times New Roman\", serif;
+           font-size: #{font_size}px; line-height: 1.35; font-weight: 400; }
+  .attribution { color: #FFFFFF; font-family: Georgia, \"DejaVu Serif\", \"Times New Roman\", serif;
+                 font-style: italic; font-size: #{attr_size}px; margin-top: 20px; }
+  .portrait-side { flex: 0 0 42%; position: relative; }
+  .portrait { position: absolute; top: 0; right: 0; height: 100%; width: 100%;
+              object-fit: cover; object-position: 30% 50%;
+              -webkit-mask-image: linear-gradient(to right, transparent 0%, black 32%),
+                                  linear-gradient(to bottom, black 55%, transparent 100%);
+              -webkit-mask-composite: source-in;
+              mask-image: linear-gradient(to right, transparent 0%, black 32%),
+                          linear-gradient(to bottom, black 55%, transparent 100%);
+              mask-composite: intersect; }
+</style></head><body>
+  <div class=\"card\">
+    <div class=\"text-side\">
+      <div class=\"quote\">&ldquo;#{text}&rdquo;</div>
+      <div class=\"attribution\">David Heinemeier Hansson</div>
+    </div>
+    <div class=\"portrait-side\">
+      <img class=\"portrait\" src=\"#{avatar}\" alt=\"\">
+    </div>
+  </div>
+</body></html>"
+end
+
+# Copies the untrimmed raw render into place and removes the temp source, so a
+# trim failure still delivers a full PNG rather than nothing.
+def fallback_to_raw(raw_path, out_path)
+  FileUtils.cp(raw_path, out_path)
+  FileUtils.rm_f(raw_path)
+end
+
+# Trims the raw render down to the post. The template renders the post tall on
+# a dead black canvas with its own 12px/16px CSS padding and no trailing
+# divider, so only the dead canvas below the content is cropped: `-trim` with
+# `trim:edges=south` drops the rows past the content's bottom edge while
+# keeping the full rendered width and the top padding — the same full-width
+# crop from y=0 the old two-invocation version produced. That one invocation
+# also prints the content bounding box (`%@` = WxH+X+Y) before trimming, so the
+# blank-render check reads the pre-trim box. On any magick failure or a blank
+# render (uniform black), falls back to the raw render so the user still gets a
+# full PNG rather than nothing.
+def trim_to_content(raw_path, out_path)
+  box, _err, status = begin
+    Open3.capture3(
+      MAGICK, raw_path, '-format', '%@', '-write', 'info:',
+      '-background', 'black', '-define', 'trim:edges=south',
+      '-trim', '+repage', out_path
+    )
+  rescue StandardError
+    ['', nil, nil]
+  end
+
+  m = box.to_s.strip.match(/\A(\d+)x(\d+)\+(-?\d+)\+(-?\d+)\z/)
+  unless status&.success? && m
+    # A failed magick may leave a partial file behind; remove it before copying
+    # the raw render over it.
+    FileUtils.rm_f(out_path)
+    fallback_to_raw(raw_path, out_path)
+    return
+  end
+
+  h = m[2].to_i
+  y = m[4].to_i
+  if h <= 0 || y + h <= 0
+    FileUtils.rm_f(out_path)
+    fallback_to_raw(raw_path, out_path)
+    return
+  end
+
+  FileUtils.rm_f(raw_path)
+end
+
+def main
+  entry = begin
+    JSON.parse(ARGV[0] || '')
+  rescue JSON::ParserError
+    nil
+  end
+
+  if !entry.is_a?(Hash) || entry['text'].to_s.empty? || entry['type'].to_s.empty?
+    warn 'invalid entry: expected { text, type, source, date? }'
+    exit 1
+  end
+
+  slug = DHHHelpers.slugify(entry['text'])
+  slug = 'dhh' if slug.empty?
+  out_dir = File.join(Dir.home, 'Pictures', 'dhh')
+  FileUtils.mkdir_p(out_dir)
+  # id is always derived from the text (never trusted from the dataset, which
+  # could carry a malformed ../ path), so the output filename cannot traverse.
+  id = DHHHelpers.entry_id(entry['text'])
+  out_path = File.join(out_dir, "#{slug}-#{id}.png")
+
+  # Already-rendered entry: return the existing PNG path immediately so a
+  # second render of the same entry never re-runs chromium.
+  if File.exist?(out_path)
+    puts out_path
+    exit 0
+  end
+
+  is_x_source = entry['source'].to_s.match?(%r{\Ahttps?://(?:www\.)?(?:x\.com|twitter\.com)(?:/|\z)})
+  is_quote = (entry['type'] == 'quote' && !is_x_source) || entry['type'] == 'link'
+  html = is_quote ? build_quote_html(entry) : build_post_html(entry)
+
+  # Temp dir is created atomically, so the intermediate paths are unpredictable
+  # and cannot collide with another render's files.
+  tmp_dir = Dir.mktmpdir('dhh-render-')
+  tmp_html = File.join(tmp_dir, 'render.html')
+  tmp_raw = File.join(tmp_dir, 'render.png')
+  # Isolate Chromium from the user's real profile: the default ~/.config/chromium
+  # singleton lock races a running browser, and reusing it would expose cookies
+  # and extensions. A per-render profile under tmp_dir is removed by the ensure.
+  profile_dir = File.join(tmp_dir, 'chromium-profile')
+  FileUtils.mkdir_p(profile_dir)
+  File.write(tmp_html, html)
+
+  begin
+    # Posts render tall then trim to content; quotes render at their fixed
+    # 16:9 card size and need no trim.
+    window_size = is_quote ? "#{WIDTH},#{QUOTE_HEIGHT}" : "#{WIDTH},#{RENDER_HEIGHT}"
+    status = Open3.capture3(
+      CHROMIUM,
+      '--headless', '--disable-gpu', '--hide-scrollbars',
+      "--user-data-dir=#{profile_dir}",
+      '--no-first-run', '--no-default-browser-check', '--disable-extensions',
+      "--force-device-scale-factor=#{SCALE}",
+      "--screenshot=#{tmp_raw}",
+      "--window-size=#{window_size}",
+      "file://#{tmp_html}"
+    ).last
+    raise "chromium exited #{status.exitstatus}" unless status.success?
+
+    if is_quote
+      # /tmp is a tmpfs here, so rename across devices fails with EXDEV; copy
+      # instead. The tmp_dir temp files are still removed in the ensure block.
+      FileUtils.cp(tmp_raw, out_path)
+    else
+      trim_to_content(tmp_raw, out_path)
+    end
+  ensure
+    FileUtils.rm_rf(tmp_dir)
+  end
+
+  # Print the PNG path as soon as it is written so the panel can show the
+  # preview even if the clipboard copy below hangs or fails. This is the
+  # script's only stdout line; the panel's stdout reader keys off it.
+  puts out_path
+  $stdout.flush
+
+  # wl-copy forks a background daemon to keep serving the clipboard; its
+  # stdout/stderr are redirected so that daemon cannot hold our pipes open. A
+  # clipboard failure must not abort the script or suppress the path above.
+  begin
+    IO.popen(['/usr/bin/wl-copy', '--type', 'image/png'], 'wb', out: File::NULL, err: File::NULL) do |io|
+      io.write(File.binread(out_path))
+    end
+  rescue StandardError => e
+    warn "wl-copy failed: #{e.message}"
+  end
+end
+
+main

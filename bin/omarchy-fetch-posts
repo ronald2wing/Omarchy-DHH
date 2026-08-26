@@ -1,0 +1,383 @@
+#!/usr/bin/env ruby
+# Fetch DHH's recent posts from api.fxtwitter.com and print ready-to-append
+# data/quotes.jsonl entries (one JSONL line each, oldest first) for any post
+# not already in the dataset. Dry run by default; --write also appends and then
+# re-sorts the file (via SortData). Emits standalone posts plus replies,
+# reposts, and quote posts — the latter three carry a `kind` and a `context`
+# describing the referenced post, mirroring the reply/repost entries already in
+# data/quotes.jsonl.
+#
+# The profile endpoint returns ~21 statuses per page (newest first) plus a
+# `cursor.bottom` token naming the next older page. --pages N walks that cursor
+# up to N pages (default 1, the historical single-page behavior); --all walks
+# until the cursor runs out or a page adds nothing new.
+
+require 'json'
+require 'net/http'
+require 'uri'
+require_relative 'dhh_helpers'
+include DHHHelpers
+# bin/omarchy-sort-data is extensionless and shebang'd (not require-able), so it
+# is load-ed here to share SortData; its CLI is guarded by __FILE__ == $PROGRAM_NAME.
+load File.join(__dir__, 'omarchy-sort-data')
+
+ENDPOINT_HOST = 'api.fxtwitter.com'
+USER_AGENT = 'omarchy-dhh-maintainer/1.0'
+TIMEOUT = 10
+# Hard stop for the cursor walk: a broken/non-advancing cursor would otherwise
+# loop forever. Each page returns ~21 statuses, so 200 pages is far past any
+# real account history.
+MAX_PAGES = 200
+# Polite pause between pages; the endpoint has no rate-limit header, but a tiny
+# delay keeps a deep walk from hammering it.
+PAGE_DELAY = 0.25
+# fxtwitter's `verification.type` for a verified account; any other value means
+# the badge variant is unknown, so the key is omitted.
+VERIFIED_TYPES = %w[individual organization government].freeze
+
+def usage
+  <<~TEXT
+    usage: bin/omarchy-fetch-posts [--limit N] [--pages N | --all] [--write] [--help]
+
+    Fetch DHH's recent posts from api.fxtwitter.com and print
+    ready-to-append data/quotes.jsonl entries (one JSONL line each, oldest
+    first) for any post not already in the dataset.
+
+    Endpoint: GET https://api.fxtwitter.com/2/profile/dhh/statuses?count=N
+    (returns ~21 statuses per page, newest first, plus a cursor for the next
+    older page)
+
+    Options:
+      --limit N   statuses to request per page (1..100, default 100; the API
+                  returns its own page size regardless)
+      --pages N   fetch at most N cursor pages (default 1). Stops early when
+                  the cursor runs out or a page adds no new entries.
+      --all       walk the cursor until it runs out or a page adds no new
+                  entries, up to a #{MAX_PAGES}-page safety cap
+      --write     append new entries to data/quotes.jsonl and re-sort the file
+                  (default is a dry run: print only, no file change)
+      --help      show this usage
+  TEXT
+end
+
+# Hand-rolled argv scan in the style of bin/omarchy-add-entry: a value flag
+# swallows the next element even when that element looks like another flag.
+limit = 100
+pages = 1
+all = false
+write = false
+help = false
+i = 0
+while i < ARGV.length
+  arg = ARGV[i]
+  case arg
+  when '--limit'
+    die('missing value for --limit') if i + 1 >= ARGV.length
+    value = ARGV[i + 1]
+    die("--limit must be an integer, got #{value.inspect}") unless value.match?(/\A\d+\z/)
+    limit = value.to_i
+    i += 1
+  when '--pages'
+    die('missing value for --pages') if i + 1 >= ARGV.length
+    value = ARGV[i + 1]
+    die("--pages must be an integer, got #{value.inspect}") unless value.match?(/\A\d+\z/)
+    pages = value.to_i
+    i += 1
+  when '--all'
+    all = true
+  when '--write'
+    write = true
+  when '--help'
+    help = true
+  else
+    die(arg.start_with?('--') ? "unknown flag: #{arg}" : "unexpected argument: #{arg}")
+  end
+  i += 1
+end
+
+if help
+  puts usage
+  exit 0
+end
+
+limit = [[limit, 1].max, 100].min
+pages_limit = all ? MAX_PAGES : [[pages, 1].max, MAX_PAGES].min
+
+def utc_date(timestamp)
+  Time.at(timestamp).utc.strftime('%Y-%m-%d')
+end
+
+# Whether the API author object is a verified account. Callers stamp
+# `context.verified` only when this is true and omit the key otherwise, so the
+# UI can tell "unverified" apart from "not fetched".
+def author_verified?(author)
+  author.is_a?(Hash) && author['verification'].is_a?(Hash) && author['verification']['verified'] == true
+end
+
+# Stamp `context.verified` and, when the badge variant is known,
+# `context.verified_type` (individual/organization/government). Both keys are
+# emitted only for a verified author; an unverified author gets neither.
+def stamp_verification(context, author)
+  return unless author_verified?(author)
+
+  context['verified'] = true
+  type = author['verification']['type']
+  context['verified_type'] = type if VERIFIED_TYPES.include?(type)
+end
+
+# GET a JSON payload from api.fxtwitter.com over the shared, already-started
+# connection. Raises RuntimeError on transport failure, non-2xx status, or
+# malformed JSON, so each caller decides whether to abort (the profile fetch)
+# or fall back (the reply context fetch).
+def fetch_fxtwitter_json(http, path)
+  uri = URI("https://#{ENDPOINT_HOST}#{path}")
+  request = Net::HTTP::Get.new(uri)
+  request['User-Agent'] = USER_AGENT
+  request['Accept'] = 'application/json'
+
+  response = begin
+    http.request(request)
+  rescue StandardError => e
+    raise "fetch failed: #{e.class}: #{e.message}"
+  end
+
+  raise "GET #{uri} failed: HTTP #{response.code} #{response.message}" unless response.is_a?(Net::HTTPSuccess)
+
+  begin
+    JSON.parse(response.body)
+  rescue JSON::ParserError => e
+    raise "invalid JSON from #{ENDPOINT_HOST}: #{e.message}"
+  end
+end
+
+# Resolve a reply's context. The replied-to post is fetched again via the
+# single-status endpoint ({code, message, tweet:{...}}), so the context can
+# carry the original author's name, handle, text, and date. When that fetch
+# fails (deleted post, transport error, non-2xx), the reply still emits with a
+# bare context of just the screen name — the same author/handle-only shape as
+# the existing bare-repost entry id 1d7ae346. Resolved contexts are cached by
+# status id, so several replies to the same post trigger one status fetch.
+def reply_context(http, result, resolved_replies)
+  replying_to = result['replying_to']
+  if replying_to.is_a?(Hash)
+    screen = replying_to['screen_name']
+    target_id = replying_to['status']
+  else
+    screen = replying_to
+    target_id = result['replying_to_status']
+  end
+
+  bare = { 'author' => screen.to_s, 'handle' => "@#{screen}" }
+  return bare if target_id.nil? || target_id.to_s.empty?
+
+  key = target_id.to_s
+  return resolved_replies[key] if resolved_replies.key?(key)
+
+  tweet = begin
+    fetch_fxtwitter_json(http, "/dhh/status/#{URI.encode_www_form_component(target_id)}")['tweet']
+  rescue RuntimeError
+    nil
+  end
+
+  author = tweet.is_a?(Hash) ? tweet['author'] : nil
+  unless author.is_a?(Hash) && author['screen_name']
+    resolved_replies[key] = bare
+    return bare
+  end
+
+  context = {
+    'author' => author['name'].to_s,
+    'handle' => "@#{author['screen_name']}"
+  }
+  text = tweet['text'].to_s
+  context['text'] = text unless text.strip.empty?
+  timestamp = tweet['created_timestamp'].to_i
+  context['date'] = utc_date(timestamp) if timestamp > 0
+  stamp_verification(context, author)
+  resolved_replies[key] = context
+  context
+end
+
+# Load the existing dataset's ids and sources once; a fetched post is new only
+# when neither its content-derived id nor its status URL is already present.
+# New posts discovered this run are added to the same maps, so later pages are
+# deduped against both the dataset and every earlier page.
+existing_ids = {}
+existing_sources = {}
+File.foreach(DHHHelpers::DATA_FILE) do |line|
+  stripped = line.strip
+  next if stripped.empty?
+
+  entry = JSON.parse(stripped)
+  existing_ids[entry['id']] = true
+  existing_sources[entry['source']] = true
+end
+
+new_entries = []
+kind_counts = { 'post' => 0, 'reply' => 0, 'quote' => 0, 'repost' => 0 }
+pages_fetched = 0
+total_results = 0
+cursor = nil
+resolved_replies = {}
+
+# Walk the cursor. No with_replies — that surfaces other users' replies. A
+# non-2xx response is an error, same as any transport failure. The loop stops
+# when the page limit is hit, the cursor runs out, or a page contributes
+# nothing new (empty timeline or a cursor that stopped advancing).
+
+# One persistent connection for the whole run. Net::HTTP.start without a block
+# returns an already-started connection, so every request (profile pages and
+# reply contexts) reuses one TLS session instead of re-handshaking per request.
+# A connect failure is wrapped identically to the historical per-request
+# "fetch failed: ..." surface.
+http = begin
+  Net::HTTP.start(
+    ENDPOINT_HOST,
+    443,
+    use_ssl: true,
+    open_timeout: TIMEOUT,
+    read_timeout: TIMEOUT
+  )
+rescue StandardError => e
+  die("fetch failed: #{e.class}: #{e.message}")
+end
+
+loop do
+  pages_fetched += 1
+  path = "/2/profile/dhh/statuses?count=#{limit}"
+  path += "&cursor=#{URI.encode_www_form_component(cursor)}" unless cursor.nil?
+
+  payload = begin
+    fetch_fxtwitter_json(http, path)
+  rescue RuntimeError => e
+    die(e.message)
+  end
+
+  results = payload['results']
+  die('unexpected response: no results array') unless results.is_a?(Array)
+
+  total_results += results.length
+  page_new = 0
+
+  results.each do |result|
+    next unless result.is_a?(Hash)
+
+    author = result['author']
+    is_dhh = author.is_a?(Hash) && author['screen_name'] == 'dhh'
+    # A repost's top-level author is the ORIGINAL author, so reposts are
+    # recognized by reposted_by rather than author == dhh.
+    is_repost = result['reposted_by'].is_a?(Hash) && result['reposted_by']['screen_name'] == 'dhh'
+
+    # Skip other authors' posts that the timeline can surface (neither DHH's own
+    # post nor a DHH repost).
+    next unless is_repost || is_dhh
+
+    text = result['text'].to_s.strip
+    # The only hard skip is a blank body; for a repost this is the original
+    # author's words.
+    next if text.empty?
+
+    timestamp = result['created_timestamp'].to_i
+    next if timestamp <= 0 # every emitted entry carries a date
+    date = utc_date(timestamp)
+
+    status_id = result['id'].to_s
+    next if status_id.empty?
+    # A repost's top-level id is the original post's id, and x.com resolves a
+    # status by its id, so the dhh-handle URL opens the same post as it appears
+    # in DHH's timeline.
+    source = "https://x.com/dhh/status/#{status_id}"
+
+    id = DHHHelpers.entry_id(text)
+
+    # Precedence when a result matches several kinds: reply > quote > repost.
+    # A reply whose body embeds another post surfaces a `quote` object too, so a
+    # reply must win over quote; a repost can't also be a reply/quote because its
+    # author is not dhh.
+    is_reply = is_dhh && (!result['replying_to'].nil? || !result['replying_to_status'].nil?)
+    is_quote = is_dhh && result['quote'].is_a?(Hash)
+
+    entry = if is_reply
+      { 'id' => id, 'type' => 'post', 'text' => text, 'source' => source, 'date' => date,
+        'kind' => 'reply', 'context' => reply_context(http, result, resolved_replies) }
+    elsif is_quote
+      quote = result['quote']
+      quote_author = quote['author']
+      # A quoted post that has since been deleted comes back as a `tombstone`
+      # with no author, so there is nothing to build a context from; fall back
+      # to a standalone post of DHH's own commentary.
+      if quote_author.is_a?(Hash) && quote_author['name'] && quote_author['screen_name']
+        context = {
+          'author' => quote_author['name'].to_s,
+          'handle' => "@#{quote_author['screen_name']}"
+        }
+        quote_text = quote['text'].to_s
+        context['text'] = quote_text unless quote_text.strip.empty?
+        quote_timestamp = quote['created_timestamp'].to_i
+        context['date'] = utc_date(quote_timestamp) if quote_timestamp > 0
+        stamp_verification(context, quote_author)
+        { 'id' => id, 'type' => 'post', 'text' => text, 'source' => source, 'date' => date,
+          'kind' => 'quote', 'context' => context }
+      else
+        { 'id' => id, 'type' => 'post', 'text' => text, 'source' => source, 'date' => date }
+      end
+    elsif is_repost
+      # Author/handle only, no context text/date — mirrors the bare-repost entry.
+      repost_context = { 'author' => author['name'].to_s, 'handle' => "@#{author['screen_name']}" }
+      stamp_verification(repost_context, author)
+      { 'id' => id, 'type' => 'post', 'text' => text, 'source' => source, 'date' => date,
+        'kind' => 'repost', 'context' => repost_context }
+    else
+      { 'id' => id, 'type' => 'post', 'text' => text, 'source' => source, 'date' => date }
+    end
+
+    next if existing_ids.key?(id) || existing_sources.key?(source)
+
+    new_entries << entry
+    kind_counts[entry['kind'] || 'post'] += 1
+    existing_ids[id] = true
+    existing_sources[source] = true
+    page_new += 1
+  end
+
+  break if pages_fetched >= pages_limit
+
+  next_cursor = payload['cursor'].is_a?(Hash) ? payload['cursor']['bottom'] : nil
+  break if next_cursor.nil? || next_cursor.to_s.empty?
+  break if page_new.zero?
+
+  cursor = next_cursor
+  sleep PAGE_DELAY
+end
+
+http.finish
+
+# The API returns newest first; emit oldest first so appends stay chronological.
+new_entries.reverse!
+
+new_entries.each { |entry| $stdout.write(JSON.generate(entry) + "\n") }
+
+appended = false
+if write && !new_entries.empty?
+  File.open(DHHHelpers::DATA_FILE, 'a') do |f|
+    new_entries.each { |entry| f.write(JSON.generate(entry) + "\n") }
+  end
+  SortData.sort_file(DHHHelpers::DATA_FILE)
+  appended = true
+end
+
+summary = "fetched #{pages_fetched} #{pages_fetched == 1 ? 'page' : 'pages'}, #{total_results} results, #{new_entries.length} new"
+if appended
+  summary += ' (appended, re-sorted)'
+elsif write
+  summary += ' (no new entries, nothing appended)'
+else
+  summary += ' (dry run)'
+end
+if new_entries.any?
+  breakdown = %w[post reply quote repost].filter_map do |kind|
+    kind_counts[kind] > 0 ? "#{kind_counts[kind]} #{kind}" : nil
+  end
+  summary += " [#{breakdown.join(', ')}]" unless breakdown.empty?
+end
+$stderr.puts(summary)

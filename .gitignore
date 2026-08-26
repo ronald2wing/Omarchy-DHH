@@ -1,0 +1,12 @@
+# Agent steering file — the marketplace rejects it in the distributable tree
+AGENTS.md
+
+# Transient temp written by bin/omarchy-sort-data next to the target file
+# (.<basename>.tmp.<pid>) before the atomic rename over it.
+data/.*.tmp.*
+
+# Editor / OS junk
+.DS_Store
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,130 @@
+#!/usr/bin/env ruby
+# Sort data/quotes.jsonl byte-preservingly by (date, id): dated entries first
+# (date ascending, id tiebreak), undated entries last (id ascending). Lines are
+# reordered as-is — JSON is parsed only to read the sort keys, never
+# re-serialized — so every emitted line is byte-identical to its input line.
+# The (date, id) key is stable for equal keys because each line's original
+# index is appended to the sort tuple. Stdlib only.
+#
+# The SortData module is also loaded by bin/omarchy-fetch-posts and
+# bin/omarchy-add-entry (via `load`, since this extensionless shebang'd script
+# cannot be `require`d), which reuse SortData.sort_file to keep the dataset
+# sorted after they append. The CLI below (--check / --print / the default
+# in-place write) runs only when this file is executed directly.
+#
+# Default writes data/quotes.jsonl in place. --check reports whether the file
+# is already sorted and exits non-zero if not. --print emits the reordered
+# lines to stdout without writing.
+
+require 'json'
+require_relative 'dhh_helpers'
+
+module SortData
+  module_function
+
+  def sorted_lines(lines)
+    keyed = lines.each_with_index.map do |line, idx|
+      entry = JSON.parse(line)
+      dated = entry['date'].is_a?(String) && !entry['date'].empty?
+      [dated ? 0 : 1, entry['date'].to_s, entry['id'].to_s, idx, line]
+    end
+    keyed.sort_by { |has_date, date, id, idx, _line| [has_date, date, id, idx] }.map(&:last)
+  end
+
+  # Sort the JSONL file at `path` in place (byte-preserving). Returns true if
+  # the file changed, false if it was already in sorted order.
+  def sort_file(path)
+    lines = File.readlines(path, mode: 'rb')
+    sorted = sorted_lines(lines)
+    return false if sorted == lines
+
+    # Atomic replace: write the reordered lines to a temp file in the same
+    # directory, then rename over the target. The same-directory temp keeps the
+    # rename on one filesystem (so it is atomic), and a crash mid-write leaves
+    # the original intact instead of a truncated dataset.
+    dir = File.dirname(path)
+    tmp = File.join(dir, ".#{File.basename(path)}.tmp.#{Process.pid}")
+    begin
+      File.open(tmp, 'wb', File.stat(path).mode & 0o7777) do |f|
+        sorted.each { |line| f.write(line) }
+      end
+      File.rename(tmp, path)
+    ensure
+      File.delete(tmp) if File.exist?(tmp)
+    end
+    true
+  end
+end
+
+if __FILE__ == $PROGRAM_NAME
+  include DHHHelpers
+
+  def usage
+    <<~TEXT
+      usage: bin/omarchy-sort-data [--file PATH] [--check | --print] [--help]
+
+      Sort a JSON Lines file by (date, id): dated entries first (date ascending,
+      id tiebreak), undated entries last (id ascending). Lines are reordered
+      as-is; JSON is parsed only to read sort keys, never re-serialized.
+
+      Options:
+        --file PATH   sort PATH instead of data/quotes.jsonl
+        --check       print whether the file is already sorted and exit non-zero
+                      if it is not (no write)
+        --print       emit the reordered lines to stdout (no write)
+        --help        show this usage
+    TEXT
+  end
+
+  file = DHHHelpers::DATA_FILE
+  check = false
+  print_only = false
+  help = false
+  i = 0
+  while i < ARGV.length
+    arg = ARGV[i]
+    case arg
+    when '--file'
+      die('missing value for --file') if i + 1 >= ARGV.length
+      file = ARGV[i + 1]
+      i += 1
+    when '--check'
+      check = true
+    when '--print'
+      print_only = true
+    when '--help'
+      help = true
+    else
+      die(arg.start_with?('--') ? "unknown flag: #{arg}" : "unexpected argument: #{arg}")
+    end
+    i += 1
+  end
+
+  if help
+    puts usage
+    exit 0
+  end
+
+  die('use either --check or --print, not both') if check && print_only
+  die("#{file} does not exist") unless File.exist?(file)
+
+  lines = File.readlines(file, mode: 'rb')
+  sorted = SortData.sorted_lines(lines)
+
+  if check
+    if sorted == lines
+      puts "#{file} is sorted"
+      exit 0
+    else
+      puts "#{file} is not sorted"
+      exit 1
+    end
+  end
+
+  if print_only
+    sorted.each { |line| $stdout.write(line) }
+    exit 0
+  end
+
+  SortData.sort_file(file)
+end

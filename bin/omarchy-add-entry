@@ -1,0 +1,109 @@
+#!/usr/bin/env ruby
+# Append helper for data/quotes.jsonl: computes the content-derived id and
+# prints one JSONL line to stdout. The two-pass argv scan reproduces the
+# original quirks exactly: pass 1 consumes value flags; pass 2 rejects unknown
+# flags. Presence-only --context-verified stamps context.verified = true;
+# --context-verified-type additionally stamps the badge variant.
+#
+# By default it prints one JSONL line to stdout (for `>> data/quotes.jsonl`).
+# --append instead appends that line to the dataset file and re-sorts it
+# (via SortData), printing only a short note to stderr. --file selects the
+# target file (default data/quotes.jsonl) and requires --append.
+# usage: bin/omarchy-add-entry --type <post|quote|link|video> --text "..." \
+#   --source URL [--date YYYY-MM-DD] [--kind reply|repost|quote \
+#   --context-author NAME --context-handle @handle [--context-text "..."] \
+#   [--context-date YYYY-MM-DD] [--context-verified \
+#   [--context-verified-type individual|organization|government]]] \
+#   [--append [--file PATH]]
+require 'json'
+require_relative 'dhh_helpers'
+include DHHHelpers
+# bin/omarchy-sort-data is extensionless and shebang'd (not require-able), so it
+# is load-ed here to share SortData; its CLI is guarded by __FILE__ == $PROGRAM_NAME.
+load File.join(__dir__, 'omarchy-sort-data')
+
+VALUE_FLAGS = %w[type text source date title domain kind context-author context-handle context-text context-date context-verified-type file]
+# Presence-only flags: they carry no following value, so pass 1 leaves them
+# alone and pass 2 accepts them alongside VALUE_FLAGS.
+BOOLEAN_FLAGS = %w[context-verified append]
+TYPES = %w[post quote link video]
+
+# Pass 1: consume value flags. A flag swallows the following argv element as its
+# value even when that element looks like another flag; a trailing flag with no
+# element after it is a distinct "missing value" failure.
+flags = {}
+i = 0
+while i < ARGV.length
+  arg = ARGV[i]
+  if arg.start_with?('--') && VALUE_FLAGS.include?(arg[2..])
+    die("missing value for #{arg}") if i + 1 >= ARGV.length
+    flags[arg[2..]] = ARGV[i + 1]
+    i += 1
+  end
+  i += 1
+end
+
+# Pass 2: reject unknown flags against the raw argv (silently-dropped flags hide
+# doc drift bugs). Runs after pass 1, so a missing value outranks an unknown flag.
+ARGV.each do |arg|
+  die("unknown flag: #{arg}") if arg.start_with?('--') && !VALUE_FLAGS.include?(arg[2..]) && !BOOLEAN_FLAGS.include?(arg[2..])
+end
+
+type = flags['type']
+text = flags['text']
+source = flags['source']
+date = flags['date']
+kind = flags['kind']
+context_verified = ARGV.include?('--context-verified')
+context_verified_type = flags['context-verified-type']
+append = ARGV.include?('--append')
+file = flags['file']
+
+die('--type must be one of: post, quote, link, video') unless TYPES.include?(type)
+die('--text is required and must be non-empty') if text.nil? || text.strip.empty?
+die('--source is required and must be non-empty') if source.nil? || source.strip.empty?
+die('--source must be an https URL') unless source.strip.start_with?('https://')
+die('--date must be YYYY-MM-DD') if !date.nil? && !DHHHelpers::DATE_RE.match?(date)
+die('--kind must be reply, repost or quote') if !kind.nil? && kind != 'reply' && kind != 'repost' && kind != 'quote'
+die('--kind is only valid for type post') if !kind.nil? && type != 'post'
+die('--context-* flags require --kind') if kind.nil? && (context_verified || flags.keys.any? { |k| k.start_with?('context-') })
+unless context_verified_type.nil?
+  die('--context-verified-type must be individual, organization, or government') unless %w[individual organization government].include?(context_verified_type)
+  die('--context-verified-type requires --context-verified') unless context_verified
+end
+die('--file requires --append') if !file.nil? && !append
+
+id = DHHHelpers.entry_id(text)
+
+entry = { 'id' => id, 'type' => type, 'text' => text, 'source' => source }
+entry['date'] = date unless date.nil?
+
+if type == 'link'
+  die('--title is required for type link') if flags['title'].nil? || flags['title'].strip.empty?
+  die('--domain is required for type link') if flags['domain'].nil? || flags['domain'].strip.empty?
+  entry['title'] = flags['title']
+  entry['domain'] = flags['domain']
+elsif !kind.nil?
+  die('--context-author is required when --kind is set') if flags['context-author'].nil? || flags['context-author'].strip.empty?
+  die('--context-handle is required when --kind is set') if flags['context-handle'].nil? || flags['context-handle'].strip.empty?
+  entry['kind'] = kind
+  entry['context'] = { 'author' => flags['context-author'], 'handle' => flags['context-handle'] }
+  entry['context']['text'] = flags['context-text'] unless flags['context-text'].nil?
+  unless flags['context-date'].nil?
+    die('--context-date must be YYYY-MM-DD') unless DHHHelpers::DATE_RE.match?(flags['context-date'])
+    entry['context']['date'] = flags['context-date']
+  end
+  entry['context']['verified'] = true if context_verified
+  entry['context']['verified_type'] = context_verified_type unless context_verified_type.nil?
+end
+
+line = JSON.generate(entry) + "\n"
+
+if append
+  target = file || DHHHelpers::DATA_FILE
+  File.open(target, 'a') { |f| f.write(line) }
+  SortData.sort_file(target)
+  $stderr.puts("appended 1 entry to #{target} (re-sorted)")
+else
+  $stdout.write(line)
+end
