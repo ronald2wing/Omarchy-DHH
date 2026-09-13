@@ -26,11 +26,21 @@ Item {
   // datasetRaw are available; null means the file has not loaded yet.
   property var pendingHistory: null
 
+  // Avatar cache: data URIs keyed by bare handle, populated by the bounded
+  // fetch below (bin/omarchy-fetch-avatar). Reassigned, never mutated in place,
+  // so QML bindings re-evaluate when the cache changes.
+  property var avatarCache: ({})
+  property var avatarPending: []
+  property var avatarInFlight: []
+
   readonly property string datasetPath: Search.fileUrlToPath(Qt.resolvedUrl("data/quotes.jsonl"))
   readonly property string homeDir: Quickshell.env("HOME")
   readonly property string stateDir: homeDir + "/.local/state/dhh"
   readonly property string recentPath: stateDir + "/recent.json"
   readonly property string historyPath: stateDir + "/history.json"
+  readonly property string avatarScriptPath: Search.fileUrlToPath(Qt.resolvedUrl("bin/omarchy-fetch-avatar"))
+  readonly property int avatarJsonMaxBytes: 4 * 1024 * 1024
+  readonly property int avatarCacheMax: 256
 
   // Fetch DHH's live post count from a keyless profile endpoint.
   // Runs once (guarded by postCountRequested); on any failure — offline, non-200,
@@ -55,6 +65,49 @@ Item {
       } catch (e) { /* leave postCount unchanged */ }
     }
     xhr.send()
+  }
+
+  // Return the cached avatar data URI for a handle, or "" when uncached. Reads
+  // root.avatarCache (not a local copy) so bindings re-evaluate when the cache
+  // is reassigned.
+  function avatarFor(handle) {
+    const h = String(handle || "").replace(/^@/, "")
+    return String(root.avatarCache[h] || "")
+  }
+
+  // Queue a set of handles for avatar fetching: coerce to strings, strip one
+  // leading @, keep only handles matching the helper's pattern, dedupe, then
+  // start the fetch. Handles already cached or in flight are skipped by
+  // _startAvatarFetch.
+  function fetchAvatars(handles) {
+    root.avatarPending = (Array.isArray(handles) ? handles : [])
+      .map(h => String(h || "").replace(/^@/, ""))
+      .filter(h => /^[A-Za-z0-9_]{1,15}$/.test(h))
+      .filter((h, i, a) => a.indexOf(h) === i)
+    root._startAvatarFetch()
+  }
+
+  // Run one bounded batch of avatar fetches. Idempotent: returns while a batch
+  // is running, and always terminates: each round caches every handle it is
+  // fetching (a data URI or ""), so the NEXT round's `wanted` filter excludes
+  // them.
+  function _startAvatarFetch() {
+    if (avatarProcess.running) return
+    const wanted = root.avatarPending.filter(h => !(h in root.avatarCache) && root.avatarInFlight.indexOf(h) === -1)
+    if (wanted.length === 0) return
+    root.avatarInFlight = wanted
+    avatarProcess.exec([root.avatarScriptPath].concat(wanted))
+    avatarWatchdog.restart()
+  }
+
+  // Cancel all avatar fetching: stop the watchdogs, SIGKILL the helper, and
+  // clear the queues. Called when the panel closes and on Service destruction.
+  function cancelAvatarFetch() {
+    avatarWatchdog.stop()
+    avatarKillWatchdog.stop()
+    if (avatarProcess.running) avatarProcess.signal(9)
+    root.avatarPending = []
+    root.avatarInFlight = []
   }
 
   // Ensure the on-disk state directory exists so the persisted stores can
@@ -224,7 +277,64 @@ Item {
     applyLoaded: raw => root.loadHistory(raw)
   }
 
+  // Bounded avatar fetch: same QML-side backstop as the profile-count fetch —
+  // SIGTERM on the watchdog, then SIGKILL on the kill watchdog if the helper
+  // hangs. The helper itself caps the byte size and enforces its own deadline.
+  Timer {
+    id: avatarWatchdog
+    interval: 12000
+    repeat: false
+    onTriggered: {
+      if (avatarProcess.running) avatarProcess.signal(15)
+      avatarKillWatchdog.restart()
+    }
+  }
+
+  Timer {
+    id: avatarKillWatchdog
+    interval: 3000
+    repeat: false
+    onTriggered: { if (avatarProcess.running) avatarProcess.signal(9) }
+  }
+
+  Process {
+    id: avatarProcess
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        // Parse the helper's handle -> data-URI JSON object. On any parse
+        // failure or an oversized response, every in-flight handle still lands
+        // in the cache as "", so the batch always terminates.
+        let parsed = null
+        if (Fmt.isWithinByteLimit(text, root.avatarJsonMaxBytes)) {
+          try { parsed = JSON.parse(text) } catch (e) { /* parsed stays null */ }
+        }
+        const merged = {}
+        root.avatarInFlight.forEach(h => {
+          merged[h] = (parsed && typeof parsed[h] === "string" && parsed[h]) ? parsed[h] : ""
+        })
+        // A property var does not emit change on in-place mutation, so reassign
+        // a fresh object. Bound the cache by resetting to just this round's
+        // entries once it exceeds the cap.
+        root.avatarCache = Object.assign({}, root.avatarCache, merged)
+        if (Object.keys(root.avatarCache).length > root.avatarCacheMax) {
+          root.avatarCache = Object.assign({}, merged)
+        }
+        root.avatarInFlight = []
+        root._startAvatarFetch()
+      }
+    }
+    onExited: {
+      avatarWatchdog.stop()
+      avatarKillWatchdog.stop()
+      root._startAvatarFetch()
+    }
+  }
+
   Component.onCompleted: {
     root.ensureStateDir()
+  }
+  Component.onDestruction: {
+    root.cancelAvatarFetch()
   }
 }

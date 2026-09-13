@@ -23,7 +23,6 @@ include DHHHelpers
 load File.join(__dir__, 'omarchy-sort-data')
 
 ENDPOINT_HOST = 'api.fxtwitter.com'
-USER_AGENT = 'omarchy-dhh-maintainer/1.0'
 TIMEOUT = 10
 # Hard stop for the cursor walk: a broken/non-advancing cursor would otherwise
 # loop forever. Each page returns ~21 statuses, so 200 pages is far past any
@@ -133,7 +132,7 @@ end
 def fetch_fxtwitter_json(http, path)
   uri = URI("https://#{ENDPOINT_HOST}#{path}")
   request = Net::HTTP::Get.new(uri)
-  request['User-Agent'] = USER_AGENT
+  request['User-Agent'] = DHHFetch::USER_AGENT
   request['Accept'] = 'application/json'
 
   response = begin

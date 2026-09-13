@@ -75,9 +75,12 @@ No Node.js is required at runtime.
 The plugin makes two lightweight network fetches at runtime, each with an
 offline fallback:
 
-- **Reply/repost quoted-card author avatars** — `https://unavatar.io/x/<handle>`
-  (handle without the leading `@`), falling back to the bundled
-  `data/avatar-default.png`.
+- **Reply/repost quoted-card author avatars** — fetched by the bounded
+  `bin/omarchy-fetch-avatar` helper from `https://unavatar.io/x/<handle>`
+  (handle without the leading `@`), with a 1 MiB per-avatar cap and a 2 MiB
+  batch budget; the data URIs are cached by `Service.qml` and the UI falls back
+  to the bundled `data/avatar-default.png` when a handle is absent or a fetch
+  fails.
 - **Live post count** — `https://api.fxtwitter.com/2/profile/dhh` (JSON
   `user.statuses`), falling back to the `postCount` default in `Service.qml`.
 
@@ -87,9 +90,10 @@ Everything else is bundled and works offline.
 
 ```sh
 omarchy plugin validate .
-ruby -c bin/omarchy-dhh-render bin/omarchy-add-entry bin/omarchy-fetch-posts bin/omarchy-sort-data bin/dhh_helpers.rb
+ruby -c bin/omarchy-dhh-render bin/omarchy-add-entry bin/omarchy-fetch-posts bin/omarchy-sort-data bin/omarchy-fetch-avatar bin/dhh_helpers.rb
 ruby tests/test_data.rb
 ruby tests/test_helpers.rb
+ruby tests/test_avatar.rb
 node tests/test_search.js
 node tests/test_format.js
 node tests/test_state.js

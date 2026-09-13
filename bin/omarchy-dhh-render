@@ -20,7 +20,6 @@ DHHHelpers.scrub_interpreter_env!
 require 'open3'
 require 'fileutils'
 require 'tmpdir'
-require 'base64'
 require 'uri'
 
 SCRIPT_ROOT = File.expand_path('..', __dir__)
@@ -47,19 +46,41 @@ SCALE = 2
 # the 2x screenshot is 1200x676. The body is the full black card with no
 # surrounding dead canvas, so quotes skip trim_to_content.
 QUOTE_HEIGHT = 338
-
-def data_uri(file, mime)
-  "data:#{mime};base64,#{Base64.strict_encode64(File.binread(file))}"
-end
+# Remote-avatar cap and timeout. DHHFetch::MAX_AVATAR_BYTES bounds the inlined
+# avatar; the fetcher aborts the moment it is crossed. AVATAR_TIMEOUT is a
+# CLI-safety backstop only and must stay well below the panel's 15s QML
+# watchdog, which has to keep winning on the UI path.
+AVATAR_TIMEOUT = 3
 
 # Action and badge icons are read from data/icon-*.svg at render time (the
 # same files the panel loads via Qt.resolvedUrl) and inlined as data URIs, so
 # the rendered glyphs can never drift from the panel again.
 def icon_data_uri(name)
-  data_uri(File.join(SCRIPT_ROOT, 'data', "icon-#{name}.svg"), 'image/svg+xml')
+  DHHFetch.data_uri('image/svg+xml',
+                    File.binread(File.join(SCRIPT_ROOT, 'data', "icon-#{name}.svg")))
 end
 
-def build_post_html(entry)
+# Fetches a context author's avatar via unavatar.io and returns it as a base64
+# data URI, or nil on any failure so the caller falls back to the bundled
+# default avatar. accept and user_agent are passed as nil to keep the request
+# bytes identical to the pre-hardening render.
+def fetch_context_avatar_data_uri(handle)
+  return nil if handle.to_s.empty?
+
+  uri = URI("https://unavatar.io/x/#{URI.encode_uri_component(handle)}")
+
+  DHHFetch.fetch(
+    uri,
+    max_bytes: DHHFetch::MAX_AVATAR_BYTES,
+    timeout: AVATAR_TIMEOUT,
+    accept: nil,
+    user_agent: nil
+  ) do |body, content_type|
+    DHHFetch.image_data_uri(content_type, body)
+  end
+end
+
+def build_post_html(entry, avatar_fetcher: method(:fetch_context_avatar_data_uri))
   # Coerce at the JSON boundary: text and the context strings can be any type,
   # and a malformed context need not be a Hash. Valid entries stay byte-identical.
   text_value = entry['text'].to_s
@@ -70,18 +91,24 @@ def build_post_html(entry)
     DHHHelpers.strip_leading_mentions(text_value, handle)
   )
   date = DHHHelpers.format_date(entry['date'])
-  avatar = data_uri(X_AVATAR_PATH, 'image/png')
-  logo = data_uri(LOGO_PATH, 'image/png')
+  avatar = DHHFetch.data_uri('image/png', File.binread(X_AVATAR_PATH))
+  logo = DHHFetch.data_uri('image/png', File.binread(LOGO_PATH))
+  # Bundled gray-circle default, inlined once and reused as the fetched-avatar
+  # fallback (and its onerror target), so the HTML embeds no remote image.
+  default_avatar = DHHFetch.data_uri('image/png', File.binread(DEFAULT_AVATAR_PATH))
 
   is_repost = entry['kind'] == 'repost'
 
   # Context author's bare handle (leading '@' stripped) and formatted date,
-  # shared by the reply quote card and the repost head. unavatar.io resolves
-  # the current avatar from the bare handle.
+  # shared by the reply quote card and the repost head. The avatar is fetched
+  # via avatar_fetcher (unavatar.io, inlined as a data URI) and never embedded
+  # as a remote URL; a nil result falls back to the default avatar.
   bare_handle = handle.sub(/\A@/, '')
-  # Percent-encode the handle to match JS encodeURIComponent (space -> %20, not
-  # '+'), so the panel's avatar URL and the rendered PNG stay in sync.
-  encoded_handle = URI.encode_uri_component(bare_handle)
+  context_avatar = avatar_fetcher.call(bare_handle) unless bare_handle.empty?
+  # Defence-in-depth: both operands are trusted base64 data URIs (the fetched
+  # body is base64 and its mime allowlisted), but escape the whole data URI
+  # anyway before it lands in a double-quoted src="".
+  avatar_src = DHHHelpers.escape_html(context_avatar || default_avatar)
   context_date = context['date'] ? DHHHelpers.format_date(context['date']) : ''
   # Context author's X verified state; absent/false hides their badge (the
   # reply/quote quote-card badge and the repost head badge). DHH's own badge is
@@ -97,16 +124,16 @@ def build_post_html(entry)
   # Reply quoted-card avatar (16px); omitted entirely when there is no handle
   # so the name+handle still render without a broken image.
   quote_avatar = bare_handle.empty? ? '' :
-    "<img class=\"quote-avatar\" src=\"https://unavatar.io/x/#{DHHHelpers.escape_html(encoded_handle)}\" onerror=\"this.onerror=null;this.src='#{data_uri(DEFAULT_AVATAR_PATH, 'image/png')}'\" alt=\"\">"
+    "<img class=\"quote-avatar\" src=\"#{avatar_src}\" onerror=\"this.onerror=null;this.src='#{default_avatar}'\" alt=\"\">"
 
   # Outer post chrome: circular avatar, then a single author line (bold name,
   # blue verified badge, 37signals logo, muted handle with an X-style relative
   # timestamp when a date is present). A repost represents the ORIGINAL post,
-  # so the head swaps DHH's portrait for the context author's unavatar.io
-  # avatar (default-avatar fallback on error) and the context name/handle, and
-  # drops the 37signals logo; its verified badge follows context.verified.
+  # so the head swaps DHH's portrait for the context author's fetched avatar
+  # (default-avatar fallback on error) and the context name/handle, and drops
+  # the 37signals logo; its verified badge follows context.verified.
   head_avatar = if is_repost
-    "<img class=\"avatar\" src=\"https://unavatar.io/x/#{DHHHelpers.escape_html(encoded_handle)}\" onerror=\"this.onerror=null;this.src='#{data_uri(DEFAULT_AVATAR_PATH, 'image/png')}'\" alt=\"\">"
+    "<img class=\"avatar\" src=\"#{avatar_src}\" onerror=\"this.onerror=null;this.src='#{default_avatar}'\" alt=\"\">"
   else
     "<img class=\"avatar\" src=\"#{avatar}\" alt=\"\">"
   end
@@ -272,7 +299,7 @@ end
 # transparent via a CSS mask so it melts into the black background.
 def build_quote_html(entry)
   text = DHHHelpers.escape_html(entry['text'])
-  avatar = data_uri(AVATAR_PATH, 'image/png')
+  avatar = DHHFetch.data_uri('image/png', File.binread(AVATAR_PATH))
   # UTF-16 code-unit length (matches JS String#length) so the longest entry
   # still fits the 338px-tall card without clipping.
   len = entry['text'].to_s.encode('UTF-16LE').bytesize / 2
@@ -414,6 +441,7 @@ def main
       '--headless', '--disable-gpu', '--hide-scrollbars',
       "--user-data-dir=#{profile_dir}",
       '--no-first-run', '--no-default-browser-check', '--disable-extensions',
+       '--offline', '--host-resolver-rules=MAP * ~NOTFOUND',
       "--force-device-scale-factor=#{SCALE}",
       "--screenshot=#{tmp_raw}",
       "--window-size=#{window_size}",

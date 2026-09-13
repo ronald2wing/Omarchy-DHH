@@ -1,0 +1,156 @@
+#!/usr/bin/env -S -u RUBYOPT -u RUBYLIB -u RUBYGEMS_GEMDEPS -u BUNDLE_GEMFILE -u BUNDLE_PATH -u BUNDLE_BIN_PATH -u GEM_HOME -u GEM_PATH /usr/bin/ruby
+
+# omarchy-fetch-avatar — fetch context-author avatars from unavatar.io and print
+# a single JSON object mapping handle -> data URI. This is the security boundary
+# that replaces the panel's direct unbounded image load: a QML Process consumes
+# stdout, so every fetch is byte-capped, deadline-bound, and TLS-verified here
+# instead of an arbitrary remote URL loading into the UI. Any invalid handle or
+# failed fetch is omitted from the output; the exit status is 1 only for
+# usage errors, 0 otherwise (including an all-failed batch, which prints "{}").
+
+require_relative 'dhh_helpers'
+require 'uri'
+require 'json'
+
+MAX_HANDLES = 64
+# Batch-wide raw-byte budget: once the running total of fetched avatar bytes
+# would cross this, the current avatar is discarded and the batch stops.
+MAX_AVATAR_TOTAL_BYTES = 2_097_152
+TOTAL_DEADLINE = 8
+HANDLE_PATTERN = /\A[A-Za-z0-9_]{1,15}\z/
+# Base per-op timeout (seconds). Each hop's open/read/ssl timeout is clipped to
+# the remaining wall-clock deadline, so a slow hop can never overrun the batch.
+BASE_TIMEOUT = 3
+
+# Production defaults. Tests override any of these (host/port/
+# use_ssl point a loopback test at a local server without TLS or an 8s wait);
+# max_total is a batch concern consumed by fetch_avatar_batch and ignored by
+# fetch_one, which fetches a single avatar.
+DEFAULT_OPTS = {
+  host: 'unavatar.io',
+  port: 443,
+  use_ssl: true,
+  max_bytes: DHHFetch::MAX_AVATAR_BYTES,
+  max_total: MAX_AVATAR_TOTAL_BYTES,
+  total_deadline: TOTAL_DEADLINE,
+  read_timeout: BASE_TIMEOUT
+}.freeze
+
+def usage
+  <<~TEXT
+    usage: bin/omarchy-fetch-avatar [@HANDLE ...] [--help]
+
+    Fetch avatars from unavatar.io and print one JSON object mapping each handle
+    to a base64 data URI. Takes zero or more handles (a single leading @ is
+    tolerated); --help prints this usage.
+
+    Each handle must match /[A-Za-z0-9_]{1,15}/. Invalid handles and failed
+    fetches are omitted from the output. At most #{MAX_HANDLES} handles,
+    #{MAX_AVATAR_TOTAL_BYTES} total bytes, and a #{TOTAL_DEADLINE}s wall-clock deadline
+    are honored; fetches are HTTPS-only and TLS-verified. Exit status is 1 only
+    for usage errors, 0 otherwise.
+  TEXT
+end
+
+# ---- pure helpers (no I/O) ----
+
+# A handle is fetchable only when it matches HANDLE_PATTERN; anything else is
+# omitted and must never reach the URL (a validated handle is the only thing
+# ever interpolated into the request path).
+def valid_handle?(handle)
+  handle.is_a?(String) && HANDLE_PATTERN.match?(handle)
+end
+
+# Monotonic seconds elapsed since `started` (a CLOCK_MONOTONIC value).
+def monotonic_elapsed_since(started)
+  Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+end
+
+# ---- I/O ----
+
+# Fetches one avatar, returning { uri:, size: } on success or nil on any
+# failure (invalid handle, non-2xx, transport error, timeout, TLS error, too
+# many redirects, or an oversized body). Redirects are followed only over HTTPS
+# (TLS is never downgraded) and capped at DHHFetch::MAX_REDIRECTS. The wall-clock
+# deadline is total_deadline measured from this call: fetch_avatar_batch threads
+# its batch remaining time in here so the whole run, not just this fetch, is
+# bounded.
+def fetch_one(handle, **opts)
+  opts = DEFAULT_OPTS.merge(opts)
+  return nil unless valid_handle?(handle)
+
+  started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  scheme = opts[:use_ssl] ? 'https' : 'http'
+  uri = URI("#{scheme}://#{opts[:host]}:#{opts[:port]}/x/#{URI.encode_uri_component(handle)}")
+
+  # The per-fetch deadline is the batch's remaining wall-clock, threaded in by
+  # fetch_avatar_batch as total_deadline; DHHFetch.fetch clips each hop to what
+  # remains so a slow hop can never overrun the batch budget.
+  remaining = opts[:total_deadline] - monotonic_elapsed_since(started)
+  return nil if remaining <= 0
+
+  DHHFetch.fetch(
+    uri,
+    max_bytes: opts[:max_bytes],
+    timeout: opts[:read_timeout],
+    accept: 'image/*',
+    deadline: remaining
+  ) do |body, content_type|
+    { uri: DHHFetch.image_data_uri(content_type, body), size: body.bytesize }
+  end
+end
+
+# Fetches a batch of handles into a handle -> data-URI Hash. Invalid handles
+# and failures are omitted. The batch shares one wall-clock deadline and one
+# raw-byte budget: when the deadline is exhausted or the running byte total
+# would cross max_total, fetching stops (and the overflowing avatar is
+# discarded).
+def fetch_avatar_batch(handles, **opts)
+  opts = DEFAULT_OPTS.merge(opts)
+  started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  results = {}
+  bytes_used = 0
+
+  handles.each do |handle|
+    remaining = opts[:total_deadline] - monotonic_elapsed_since(started)
+    break if remaining <= 0
+    break if bytes_used >= opts[:max_total]
+
+    # Thread the batch's remaining wall-clock into the single fetch, so its
+    # per-hop timeouts are clipped to the batch deadline rather than restarted.
+    result = fetch_one(handle, **opts.merge(total_deadline: remaining))
+    next unless result
+
+    # Batch-wide raw-byte budget: if this avatar would push the running total
+    # over the cap, discard it and stop — no further avatars are fetched.
+    break if bytes_used + result[:size] > opts[:max_total]
+
+    bytes_used += result[:size]
+    results[handle] = result[:uri]
+  end
+
+  results
+end
+
+def main
+  if ARGV == ['--help']
+    puts usage
+    exit 0
+  end
+  if ARGV.length > MAX_HANDLES
+    warn "too many handles: #{ARGV.length} (max #{MAX_HANDLES})"
+    exit 1
+  end
+
+  # Tolerate one leading @ on the command line; the bare handle is validated
+  # against HANDLE_PATTERN inside fetch_one.
+  handles = ARGV.map { |arg| arg.start_with?('@') ? arg[1..] : arg }
+
+  $stdout.binmode
+  $stdout.write(JSON.generate(fetch_avatar_batch(handles)) + "\n")
+  exit 0
+end
+
+if __FILE__ == $PROGRAM_NAME
+  main
+end

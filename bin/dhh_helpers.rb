@@ -3,6 +3,11 @@
 # byte-for-byte (including the places where the JS is quirky: _hash32 is not
 # canonical FNV-1a because JS multiplies with IEEE-754 doubles, and formatEngagementCount
 # relies on JS Number-to-String dropping a trailing ".0"). Stdlib only.
+#
+# Shared HTTP transport for the network helpers (DHHFetch below): byte-capped,
+# deadline-bound, TLS-verified fetches with a common redirect policy. `net/http`
+# is required lazily inside DHHFetch.fetch, so local-only tools
+# (omarchy-add-entry, omarchy-sort-data) that require this file never load it.
 
 require 'digest'
 
@@ -140,5 +145,93 @@ module DHHHelpers
   def scrub_interpreter_env!
     %w[RUBYOPT RUBYLIB RUBYGEMS_GEMDEPS GEM_HOME GEM_PATH].each { |k| ENV.delete(k) }
     ENV.delete_if { |k, _| k.start_with?('BUNDLE_') }
+  end
+end
+
+module DHHFetch
+  USER_AGENT = 'omarchy-dhh-maintainer/1.0'
+  MAX_REDIRECTS = 3
+  # Per-avatar body cap shared by the avatar fetcher and the render: the
+  # streaming accumulator aborts the instant it crosses this, so a chunked
+  # response without a Content-Length cannot balloon memory.
+  MAX_AVATAR_BYTES = 1_048_576
+  MIME_ALLOWLIST = %r{\Aimage/(png|jpe?g|gif|webp)\z}
+  class BodyTooLarge < StandardError; end
+
+  def self.read_capped_body(response, max_bytes:)
+    body = +''
+    response.read_body do |chunk|
+      body << chunk
+      raise BodyTooLarge if body.bytesize > max_bytes
+    end
+    body
+  end
+
+  def self.data_uri(mime, bytes)
+    "data:#{mime};base64,#{[bytes].pack('m0')}"
+  end
+
+  def self.normalized_image_mime(content_type)
+    mime = content_type.to_s.split(';').first.to_s.strip
+    MIME_ALLOWLIST.match?(mime) ? mime : 'image/png'
+  end
+
+  def self.image_data_uri(content_type, bytes)
+    data_uri(normalized_image_mime(content_type), bytes)
+  end
+
+  # Returns the block's value on 2xx, nil on any failure.
+  # timeout: per-hop open/read/write/ssl seconds.
+  # deadline: remaining wall-clock seconds for this fetch (nil = unbounded);
+  #           each hop is clipped to what remains.
+  def self.fetch(uri, max_bytes:, timeout:,
+                 accept: nil, user_agent: USER_AGENT, deadline: nil)
+    require 'net/http'
+
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    redirects = 0
+    current = uri
+
+    loop do
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+      remaining = deadline && deadline - elapsed
+      return nil if remaining && remaining <= 0
+
+      hop = remaining ? [timeout, remaining].min : timeout
+
+      result = nil
+      next_url = nil
+
+      Net::HTTP.start(
+        current.host, current.port,
+        use_ssl: current.is_a?(URI::HTTPS),
+        open_timeout: hop, read_timeout: hop, write_timeout: hop, ssl_timeout: hop
+      ) do |http|
+        request = Net::HTTP::Get.new(current.request_uri)
+        request['User-Agent'] = user_agent if user_agent
+        request['Accept'] = accept if accept
+        http.request(request) do |response|
+          if response.is_a?(Net::HTTPSuccess)
+            result = yield(read_capped_body(response, max_bytes: max_bytes), response['content-type'])
+          elsif response.is_a?(Net::HTTPRedirection)
+            redirects += 1
+            next if redirects > MAX_REDIRECTS
+
+            location = response['location'].to_s
+            next if location.empty?
+
+            target = URI.join(current.to_s, location)
+            next_url = target if target.is_a?(URI::HTTPS)
+          end
+        end
+      end
+
+      return result if result
+      return nil unless next_url
+
+      current = next_url
+    end
+  rescue StandardError
+    nil
   end
 end

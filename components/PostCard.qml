@@ -174,11 +174,12 @@ Rectangle {
       }
 
       // Repost: the card represents the original author, so the avatar is
-      // theirs (fetched via unavatar.io) rather than DHH's bundled one.
+      // theirs. It comes from the Service cache (prefetched by the panel) and
+      // falls back to the bundled default in CircularAvatar when uncached.
       CircularAvatar {
         visible: card.entry.kind === "repost"
         size: Style.space(40)
-        source: Search.contextAvatarUrl(Search.contextHandleOf(card.entry))
+        source: panel.contextAvatarSource(Search.contextHandleOf(card.entry))
         fallbackSource: panel.defaultAvatarSource
       }
 
@@ -361,7 +362,7 @@ Rectangle {
                 spacing: Style.spacing.xs
                 CircularAvatar {
                   size: Style.space(20)
-                  source: Search.contextAvatarUrl(card.entry.context && card.entry.context.handle)
+                  source: panel.contextAvatarSource(card.entry.context && card.entry.context.handle)
                   fallbackSource: panel.defaultAvatarSource
                   anchors.verticalCenter: parent.verticalCenter
                 }
