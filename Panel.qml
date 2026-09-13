@@ -155,11 +155,15 @@ Panel {
   function open() {
     if (root.service) root.service.ensureDatasetLoaded()
     if (root.service) root.service.fetchPostCount()
+    if (root.service) root.service.fetchAvatars(root.avatarHandlesFor(root.service.history))
     controller.show()
   }
 
   function close() { controller.hide() }
 
+  onOpenedChanged: {
+    if (!root.opened && root.service) root.service.cancelAvatarFetch()
+  }
   function toggle() {
     if (root.opened) { root.close(); return }
     root.open()
@@ -187,6 +191,19 @@ Panel {
     if (terms.length === 0 || !list) return list || []
     const trending = terms.filter(t => list.includes(t))
     return trending.concat(list.filter(w => !trending.includes(w)))
+  }
+
+  // Resolve a context author's avatar from the Service cache; "" when uncached
+  // (CircularAvatar then falls back to the bundled default).
+  function contextAvatarSource(handle) {
+    return root.service ? root.service.avatarFor(handle) : ""
+  }
+
+  // Collect the context handles worth prefetching avatars for: take each
+  // entry's context handle raw. Service.fetchAvatars normalizes (strips one
+  // leading @), validates against the helper's pattern, and dedupes.
+  function avatarHandlesFor(entries) {
+    return Array.isArray(entries) ? entries.map(e => Search.contextHandleOf(e)) : []
   }
 
   function runSearch() {
@@ -459,6 +476,7 @@ Panel {
         })
       })
       resultModel.append(items)
+      if (root.service) root.service.fetchAvatars(root.avatarHandlesFor(hits))
       root.updateResultStatus(typeof msg.total === "number" ? msg.total : hits.length, !!msg.capped)
       root.selectedIndex = 0
       // Populate suggestions after the list settles so the dropdown opens only

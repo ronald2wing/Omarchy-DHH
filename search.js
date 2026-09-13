@@ -55,14 +55,6 @@ function contextHandleOf(e) {
   return e && e.context && e.context.handle ? String(e.context.handle || "") : ""
 }
 
-// Resolve a context author's avatar via unavatar.io (dynamic, fetched online at
-// runtime). Strips the leading '@' — the resolver expects the bare handle.
-// Returns "" for a missing handle (no avatar rendered).
-function contextAvatarUrl(handle) {
-  const h = String(handle || "")
-  return h ? "https://unavatar.io/x/" + encodeURIComponent(h.replace(/^@/, "")) : ""
-}
-
 // Clamp a caller-supplied max/count to a positive number, falling back to
 // `fallback` when the argument is not a positive number.
 function _clampMax(n, fallback) {

@@ -102,6 +102,13 @@ assert(F.utf8ByteLength("\u20AC") === 3, "utf8ByteLength 3-byte")
 assert(F.utf8ByteLength("\uD83D\uDCA1") === 4, "utf8ByteLength emoji surrogate pair")
 assert(F.utf8ByteLength("a\u00E9\u20AC\uD83D\uDCA1") === 10, "utf8ByteLength mixed")
 
+// withinByteLimit: inclusive byte cap over the utf8ByteLength measure.
+assert(F.withinByteLimit("", 0) === true, "withinByteLimit empty within 0")
+assert(F.withinByteLimit("\u00E9", 2) === true, "withinByteLimit 2-byte within 2")
+assert(F.withinByteLimit("\u00E9", 1) === false, "withinByteLimit 2-byte over 1")
+assert(F.withinByteLimit("\uD83D\uDCA1", 4) === true, "withinByteLimit 4-byte emoji within 4")
+assert(F.withinByteLimit("\uD83D\uDCA1", 3) === false, "withinByteLimit 4-byte emoji over 3")
+
 // highlightHtml: match against the RAW text, then escape each segment (and the
 // matched span) separately, wrapping matches in <b>…</b>.
 assert(F.highlightHtml("hello <world>", "") === "hello &lt;world&gt;", "highlightHtml empty query returns escaped text")
