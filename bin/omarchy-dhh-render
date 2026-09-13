@@ -46,11 +46,16 @@ SCALE = 2
 # the 2x screenshot is 1200x676. The body is the full black card with no
 # surrounding dead canvas, so quotes skip trim_to_content.
 QUOTE_HEIGHT = 338
-# Remote-avatar cap and timeout. DHHFetch::MAX_AVATAR_BYTES bounds the inlined
-# avatar; the fetcher aborts the moment it is crossed. AVATAR_TIMEOUT is a
-# CLI-safety backstop only and must stay well below the panel's 15s QML
-# watchdog, which has to keep winning on the UI path.
+# Remote-avatar cap and process-supervisor deadlines. DHHFetch::MAX_AVATAR_BYTES
+# bounds the inlined avatar; the fetcher aborts the moment it is crossed. The
+# CHROMIUM/MAGICK deadlines are CLI-safety backstops only and must stay above
+# the panel's 15s QML watchdog; KILL_GRACE is the TERM->KILL grace and must
+# stay below it.
+# Per-hop timeout for the context-avatar fetch.
 AVATAR_TIMEOUT = 3
+CHROMIUM_DEADLINE = 30
+MAGICK_DEADLINE = 30
+KILL_GRACE = 2
 
 # Action and badge icons are read from data/icon-*.svg at render time (the
 # same files the panel loads via Qt.resolvedUrl) and inlined as data URIs, so
@@ -347,6 +352,78 @@ def fallback_to_raw(raw_path, out_path)
   FileUtils.rm_f(raw_path)
 end
 
+# Process-group id of the running child, read by the TERM trap. Guarded by
+# CHILD_PID_MUTEX: the trap runs on the main thread while run_captured_group
+# updates it.
+CHILD_PID_MUTEX = Mutex.new
+$active_child_pid = nil
+
+# Sends -TERM to the child's process group, waits `grace` for it to exit via
+# the block (the watchdog joins the wait thread; the TERM trap sleeps, since it
+# holds no thread handle), then -KILLs the group if it is still alive. ESRCH on
+# either signal means the child already exited; nothing left to signal.
+def terminate_process_group(pid, grace)
+  begin
+    Process.kill('-TERM', pid)
+  rescue Errno::ESRCH
+    return
+  end
+
+  return unless yield(grace)
+
+  begin
+    Process.kill('-KILL', pid)
+  rescue Errno::ESRCH
+    # Reaped during the grace window.
+  end
+end
+
+# Runs cmd in its own process group with a hard wall-clock deadline and a
+# SIGTERM grace window: on timeout the whole group is signalled -TERM, then
+# -KILL after grace, and reaped. stdout/stderr are drained on reader threads
+# (joined in an ensure) so a full pipe can never deadlock the child. Returns
+# [stdout, stderr, status, killed]. CLI-safety backstop only — the panel's 15s
+# watchdog fires first on the UI path, so deadline must stay above it.
+def run_captured_group(cmd, deadline:, grace:)
+  killed = false
+  stdout = +''
+  stderr = +''
+  status = nil
+
+  Open3.popen3(*cmd, pgroup: true) do |stdin, out, err, wait_thr|
+    stdin.close
+    pid = wait_thr.pid
+    CHILD_PID_MUTEX.synchronize { $active_child_pid = pid }
+
+    out_t = Thread.new { out.read }
+    err_t = Thread.new { err.read }
+
+    watchdog = Thread.new do
+      next if wait_thr.join(deadline)
+
+      killed = true
+      terminate_process_group(pid, grace) { |g| !wait_thr.join(g) }
+    end
+    watchdog.join
+
+    begin
+      stdout = out_t.value
+      stderr = err_t.value
+    ensure
+      out_t.join
+      err_t.join
+      out.close
+      err.close
+    end
+
+    status = wait_thr.value
+  ensure
+    CHILD_PID_MUTEX.synchronize { $active_child_pid = nil }
+  end
+
+  [stdout, stderr, status, killed]
+end
+
 # Trims the raw render down to the post. The template renders the post tall on
 # a dead black canvas with its own 12px/16px CSS padding and no trailing
 # divider, so only the dead canvas below the content is cropped: `-trim` with
@@ -358,18 +435,20 @@ end
 # render (uniform black), falls back to the raw render so the user still gets a
 # full PNG rather than nothing.
 def trim_to_content(raw_path, out_path)
-  box, _err, status = begin
-    Open3.capture3(
-      MAGICK, raw_path, '-format', '%@', '-write', 'info:',
-      '-background', 'black', '-define', 'trim:edges=south',
-      '-trim', '+repage', out_path
+  box, _err, status, killed = begin
+    run_captured_group(
+      [MAGICK, raw_path, '-format', '%@', '-write', 'info:',
+       '-background', 'black', '-define', 'trim:edges=south',
+       '-trim', '+repage', out_path],
+      deadline: MAGICK_DEADLINE, grace: KILL_GRACE
     )
   rescue StandardError
-    ['', nil, nil]
+    ['', nil, nil, false]
   end
 
   m = box.to_s.strip.match(/\A(\d+)x(\d+)\+(-?\d+)\+(-?\d+)\z/)
-  unless status&.success? && m
+  ok = !killed && status&.success? && m
+  unless ok
     # A failed magick may leave a partial file behind; remove it before copying
     # the raw render over it.
     FileUtils.rm_f(out_path)
@@ -436,17 +515,19 @@ def main
     # Posts render tall then trim to content; quotes render at their fixed
     # 16:9 card size and need no trim.
     window_size = is_quote ? "#{WIDTH},#{QUOTE_HEIGHT}" : "#{WIDTH},#{RENDER_HEIGHT}"
-    status = Open3.capture3(
-      CHROMIUM,
-      '--headless', '--disable-gpu', '--hide-scrollbars',
-      "--user-data-dir=#{profile_dir}",
-      '--no-first-run', '--no-default-browser-check', '--disable-extensions',
+    _out, _err, status, killed = run_captured_group(
+      [CHROMIUM,
+       '--headless', '--disable-gpu', '--hide-scrollbars',
+       "--user-data-dir=#{profile_dir}",
+       '--no-first-run', '--no-default-browser-check', '--disable-extensions',
        '--offline', '--host-resolver-rules=MAP * ~NOTFOUND',
-      "--force-device-scale-factor=#{SCALE}",
-      "--screenshot=#{tmp_raw}",
-      "--window-size=#{window_size}",
-      "file://#{tmp_html}"
-    ).last
+       "--force-device-scale-factor=#{SCALE}",
+       "--screenshot=#{tmp_raw}",
+       "--window-size=#{window_size}",
+       "file://#{tmp_html}"],
+      deadline: CHROMIUM_DEADLINE, grace: KILL_GRACE
+    )
+    raise 'chromium timed out' if killed
     raise "chromium exited #{status.exitstatus}" unless status.success?
 
     if is_quote
@@ -478,4 +559,17 @@ def main
   end
 end
 
-main
+if __FILE__ == $PROGRAM_NAME
+  # Forward SIGTERM to the active child's process group (not just the child),
+  # escalating -TERM to -KILL after KILL_GRACE so a TERM-ignoring child can't
+  # survive the render; then exit normally so every ensure — including
+  # FileUtils.rm_rf(tmp_dir) — runs. `exit` (not `exit!`) allows that unwinding.
+  # Safe only because Ruby services traps on the main thread at VM safe points.
+  Signal.trap('TERM') do
+    pid = CHILD_PID_MUTEX.synchronize { $active_child_pid }
+    terminate_process_group(pid, KILL_GRACE) { |g| sleep(g) } if pid
+    exit 1
+  end
+
+  main
+end
