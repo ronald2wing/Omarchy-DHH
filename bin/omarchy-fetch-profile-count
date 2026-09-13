@@ -1,0 +1,92 @@
+#!/usr/bin/env -S -u RUBYOPT -u RUBYLIB -u RUBYGEMS_GEMDEPS -u BUNDLE_GEMFILE -u BUNDLE_PATH -u BUNDLE_BIN_PATH -u GEM_HOME -u GEM_PATH /usr/bin/ruby
+
+# omarchy-fetch-profile-count — fetch DHH's profile JSON from
+# api.fxtwitter.com and print the raw body to stdout. Replaces the panel's
+# unbounded XMLHttpRequest: a QML Process consumes stdout, so the fetch is
+# byte-capped and deadline-bound here instead of risking a hung or oversized
+# response pinning the UI. Success prints the body (and nothing else) and exits
+# 0; any failure prints one line to stderr and exits 1.
+
+require_relative 'dhh_helpers'
+require 'uri'
+
+PROFILE_URL = URI('https://api.fxtwitter.com/2/profile/dhh')
+# Streaming byte cap: the body accumulates chunk by chunk and aborts the instant
+# it crosses this, so a chunked (Content-Length-less) response cannot balloon
+# memory — the panel only needs the follower/following counts, not the timeline.
+MAX_PROFILE_BYTES = 64 * 1024
+OPEN_TIMEOUT = 5
+READ_TIMEOUT = 5
+
+def usage
+  <<~TEXT
+    usage: bin/omarchy-fetch-profile-count [--help]
+
+    Fetch DHH's profile JSON from #{PROFILE_URL} and print the raw body to
+    stdout. Takes no arguments; --help prints this usage.
+
+    The body is byte-capped at #{MAX_PROFILE_BYTES} bytes, the fetch is
+    deadline-bound (#{OPEN_TIMEOUT}s open, #{READ_TIMEOUT}s read), and redirects
+    are limited to #{DHHFetch::MAX_REDIRECTS} HTTPS-only hops. On any failure a
+    one-line diagnostic is written to stderr and the exit status is 1.
+  TEXT
+end
+
+# One GET of PROFILE_URL's path on host:port, following redirects. Returns the
+# body on success, nil on any transport error, non-2xx, oversized body, or
+# redirect limit — every StandardError is absorbed in DHHFetch.fetch so callers
+# never rescue. Redirect targets must be HTTPS (TLS is never downgraded) and are
+# capped at DHHFetch::MAX_REDIRECTS. use_ssl applies to the first hop; later hops
+# are HTTPS by construction. The shared transport collapses the per-hop
+# open/read/write/ssl timeouts to the tighter of open/read, so a stalled hop
+# still fails on the same deadline.
+def perform_request(host, port, use_ssl:, open_timeout:, read_timeout:, max_bytes:)
+  uri = URI("#{use_ssl ? 'https' : 'http'}://#{host}:#{port}#{PROFILE_URL.path}")
+
+  DHHFetch.fetch(
+    uri,
+    max_bytes: max_bytes,
+    timeout: [open_timeout, read_timeout].min,
+    accept: 'application/json'
+  ) do |body, _content_type|
+    body
+  end
+end
+
+# Enforces HTTPS-only on the entry URL, then delegates to perform_request.
+def fetch_profile_body(url)
+  return nil unless url.is_a?(URI::HTTPS)
+
+  perform_request(
+    url.host, url.port,
+    use_ssl: true,
+    open_timeout: OPEN_TIMEOUT,
+    read_timeout: READ_TIMEOUT,
+    max_bytes: MAX_PROFILE_BYTES
+  )
+end
+
+def main
+  if ARGV == ['--help']
+    puts usage
+    exit 0
+  end
+  if ARGV.any?
+    warn "unexpected argument: #{ARGV.first}"
+    exit 1
+  end
+
+  body = fetch_profile_body(PROFILE_URL)
+  if body.nil?
+    warn 'profile fetch failed'
+    exit 1
+  end
+
+  $stdout.binmode
+  $stdout.write(body)
+  exit 0
+end
+
+if __FILE__ == $PROGRAM_NAME
+  main
+end
