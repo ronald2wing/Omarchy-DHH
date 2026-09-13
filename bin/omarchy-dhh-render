@@ -1,4 +1,4 @@
-#!/usr/bin/env ruby
+#!/usr/bin/env -S -u RUBYOPT -u RUBYLIB -u RUBYGEMS_GEMDEPS -u BUNDLE_GEMFILE -u BUNDLE_PATH -u BUNDLE_BIN_PATH -u GEM_HOME -u GEM_PATH /usr/bin/ruby
 
 # omarchy-dhh-render — render a DHH quote/post as a PNG and copy it to the
 # clipboard. Reads one entry JSON from ARGV[0], builds an HTML template styled
@@ -13,12 +13,15 @@
 # are transcribed byte-for-byte so rendered output is identical.
 
 require 'json'
+require_relative 'dhh_helpers'
+# `json` and `dhh_helpers`' `digest` are the documented residuals — loaded
+# before the scrub; everything below loads after DHHHelpers.scrub_interpreter_env!.
+DHHHelpers.scrub_interpreter_env!
 require 'open3'
 require 'fileutils'
 require 'tmpdir'
 require 'base64'
 require 'uri'
-require_relative 'dhh_helpers'
 
 SCRIPT_ROOT = File.expand_path('..', __dir__)
 AVATAR_PATH = File.join(SCRIPT_ROOT, 'data', 'avatar.png')

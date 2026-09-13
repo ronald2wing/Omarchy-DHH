@@ -1,4 +1,4 @@
-#!/usr/bin/env ruby
+#!/usr/bin/env -S -u RUBYOPT -u RUBYLIB -u RUBYGEMS_GEMDEPS -u BUNDLE_GEMFILE -u BUNDLE_PATH -u BUNDLE_BIN_PATH -u GEM_HOME -u GEM_PATH /usr/bin/ruby
 # Fetch DHH's recent posts from api.fxtwitter.com and print ready-to-append
 # data/quotes.jsonl entries (one JSONL line each, oldest first) for any post
 # not already in the dataset. Dry run by default; --write also appends and then
@@ -16,6 +16,7 @@ require 'json'
 require 'net/http'
 require 'uri'
 require_relative 'dhh_helpers'
+DHHHelpers.scrub_interpreter_env!
 include DHHHelpers
 # bin/omarchy-sort-data is extensionless and shebang'd (not require-able), so it
 # is load-ed here to share SortData; its CLI is guarded by __FILE__ == $PROGRAM_NAME.
