@@ -1,4 +1,4 @@
-#!/usr/bin/env ruby
+#!/usr/bin/env -S -u RUBYOPT -u RUBYLIB -u RUBYGEMS_GEMDEPS -u BUNDLE_GEMFILE -u BUNDLE_PATH -u BUNDLE_BIN_PATH -u GEM_HOME -u GEM_PATH /usr/bin/ruby
 # Append helper for data/quotes.jsonl: computes the content-derived id and
 # prints one JSONL line to stdout. The two-pass argv scan reproduces the
 # original quirks exactly: pass 1 consumes value flags; pass 2 rejects unknown
@@ -17,6 +17,7 @@
 #   [--append [--file PATH]]
 require 'json'
 require_relative 'dhh_helpers'
+DHHHelpers.sanitize_environment!
 include DHHHelpers
 # bin/omarchy-sort-data is extensionless and shebang'd (not require-able), so it
 # is load-ed here to share SortData; its CLI is guarded by __FILE__ == $PROGRAM_NAME.

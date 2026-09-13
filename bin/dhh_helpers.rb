@@ -131,4 +131,16 @@ module DHHHelpers
 
     "#{MONTHS[month_index]} #{day}, #{year}"
   end
+
+  # Remove Ruby/Bundler env vars that could inject code or load paths. RUBYOPT,
+  # RUBYLIB, and the rest are applied by the interpreter BEFORE this method
+  # runs, so this scrub cannot undo anything already loaded and only bounds
+  # child processes and later loads; the hardened shebang is the real control.
+  def sanitize_environment!
+    %w[RUBYOPT RUBYLIB RUBYGEMS_GEMDEPS GEM_HOME GEM_PATH].each do |k|
+      ENV.delete(k)
+    end
+    ENV.delete_if { |k, _| k.start_with?('BUNDLE_') }
+    nil
+  end
 end
