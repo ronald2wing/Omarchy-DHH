@@ -412,7 +412,10 @@ Panel {
   // the busy state so the UI never stays dim, kill the stuck process so the
   // next render starts clean, and surface a specific message. onExited fires
   // right after the kill and is gated on renderTimedOut so it cannot overwrite
-  // this message with the generic "Render failed".
+  // this message with the generic "Render failed". The Quickshell Process type
+  // exposes only signal(int), no group kill, so group termination and KILL
+  // escalation live in the Ruby helper; this timer sends SIGTERM (15) and arms
+  // the SIGKILL backstop below.
   Timer {
     id: renderWatchdog
     interval: 15000
@@ -423,7 +426,18 @@ Panel {
       root.renderingEntryText = ""
       root.showToast("Render timed out")
       if (renderProcess.running) renderProcess.signal(15)
+      renderKillWatchdog.restart()
     }
+  }
+
+  // Grace window for the Ruby helper's own TERM->KILL escalation before the UI
+  // forces SIGKILL: this timer is the UI-side backstop that escalates to SIGKILL
+  // if SIGTERM is ignored.
+  Timer {
+    id: renderKillWatchdog
+    interval: 3000
+    repeat: false
+    onTriggered: { if (renderProcess.running) renderProcess.signal(9) }
   }
 
   // Self-heal: if the init handshake stalls (a chunk dropped, worker never
@@ -521,6 +535,7 @@ Panel {
     }
     onExited: (exitCode) => {
       renderWatchdog.stop()
+      renderKillWatchdog.stop()
       root.renderingEntryText = ""
       root.rendering = false
       if (exitCode !== 0 && !root.renderTimedOut) {
