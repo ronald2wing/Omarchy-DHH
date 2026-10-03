@@ -162,8 +162,12 @@ Panel {
   function close() { controller.hide() }
 
   onOpenedChanged: {
-    if (!root.opened && root.service) root.service.cancelAvatarFetch()
+    if (!root.opened && root.service) {
+      root.service.cancelPostCountFetch()
+      root.service.cancelAvatarFetch()
+    }
   }
+
   function toggle() {
     if (root.opened) { root.close(); return }
     root.open()

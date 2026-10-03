@@ -38,33 +38,31 @@ Item {
   readonly property string stateDir: homeDir + "/.local/state/dhh"
   readonly property string recentPath: stateDir + "/recent.json"
   readonly property string historyPath: stateDir + "/history.json"
+  readonly property string profileCountScriptPath: Search.fileUrlToPath(Qt.resolvedUrl("bin/omarchy-fetch-profile-count"))
+  readonly property int profileCountJsonMaxBytes: 64 * 1024
   readonly property string avatarScriptPath: Search.fileUrlToPath(Qt.resolvedUrl("bin/omarchy-fetch-avatar"))
   readonly property int avatarJsonMaxBytes: 4 * 1024 * 1024
   readonly property int avatarCacheMax: 256
 
   // Fetch DHH's live post count from a keyless profile endpoint.
-  // Runs once (guarded by postCountRequested); on any failure — offline, non-200,
-  // or a response shape without a numeric user.statuses — postCount keeps its
-  // offline fallback default.
+  // Runs once (guarded by postCountRequested) via the bounded Ruby helper
+  // bin/omarchy-fetch-profile-count, which prints the raw JSON body to stdout
+  // (exit 0) or a one-line error to stderr (exit 1). The helper enforces its
+  // own byte cap and deadline; the watchdogs below are a QML-side backstop. On
+  // any failure the offline fallback default is left unchanged.
   function fetchPostCount() {
     if (root.postCountRequested) return
     root.postCountRequested = true
-    const xhr = new XMLHttpRequest()
-    xhr.open("GET", "https://api.fxtwitter.com/2/profile/dhh")
-    xhr.timeout = 5000
-    xhr.setRequestHeader("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
-    xhr.onreadystatechange = () => {
-      if (xhr.readyState !== XMLHttpRequest.DONE) return
-      if (xhr.status !== 200) return
-      try {
-        const data = JSON.parse(xhr.responseText)
-        const n = data && data.user ? data.user.statuses : null
-        if (typeof n === "number" && isFinite(n)) {
-          root.postCount = Fmt.formatProfileCount(n) + " posts"
-        }
-      } catch (e) { /* leave postCount unchanged */ }
-    }
-    xhr.send()
+    profileCountProcess.exec([root.profileCountScriptPath])
+    profileCountWatchdog.restart()
+  }
+
+  // Cancel an in-flight profile-count fetch: stop the watchdogs and SIGKILL
+  // the helper. Called when the panel closes and on Service destruction.
+  function cancelPostCountFetch() {
+    profileCountWatchdog.stop()
+    profileCountKillWatchdog.stop()
+    if (profileCountProcess.running) profileCountProcess.signal(9)
   }
 
   // Return the cached avatar data URI for a handle, or "" when uncached. Reads
@@ -277,6 +275,50 @@ Item {
     applyLoaded: raw => root.loadHistory(raw)
   }
 
+  // Bounded profile-count fetch: the Ruby helper caps the response size and
+  // enforces its own deadline, but these timers are the QML-side backstop that
+  // escalate SIGTERM -> SIGKILL if the helper hangs (the Quickshell Process
+  // type exposes only signal(int), no group kill).
+  Timer {
+    id: profileCountWatchdog
+    interval: 12000
+    repeat: false
+    onTriggered: {
+      if (profileCountProcess.running) profileCountProcess.signal(15)
+      profileCountKillWatchdog.restart()
+    }
+  }
+
+  Timer {
+    id: profileCountKillWatchdog
+    interval: 3000
+    repeat: false
+    onTriggered: { if (profileCountProcess.running) profileCountProcess.signal(9) }
+  }
+
+  Process {
+    id: profileCountProcess
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        // Defense in depth on top of the helper's own cap: bound the parse cost
+        // even if a misbehaving helper writes more than expected.
+        if (!Fmt.isWithinByteLimit(text, root.profileCountJsonMaxBytes)) return
+        try {
+          const data = JSON.parse(text)
+          const n = data && data.user ? data.user.statuses : null
+          if (typeof n === "number" && isFinite(n)) {
+            root.postCount = Fmt.formatProfileCount(n) + " posts"
+          }
+        } catch (e) { /* leave postCount unchanged */ }
+      }
+    }
+    onExited: {
+      profileCountWatchdog.stop()
+      profileCountKillWatchdog.stop()
+    }
+  }
+
   // Bounded avatar fetch: same QML-side backstop as the profile-count fetch —
   // SIGTERM on the watchdog, then SIGKILL on the kill watchdog if the helper
   // hangs. The helper itself caps the byte size and enforces its own deadline.
@@ -334,7 +376,9 @@ Item {
   Component.onCompleted: {
     root.ensureStateDir()
   }
+
   Component.onDestruction: {
+    root.cancelPostCountFetch()
     root.cancelAvatarFetch()
   }
 }
