@@ -104,6 +104,13 @@ function utf8ByteLength(s) {
   return bytes
 }
 
+// True when `s` is within `max` UTF-8 bytes. QML-only guard for remote response
+// bodies: deliberately NOT ported to bin/dhh_helpers.rb, so it stays off the
+// JS<->Ruby parity surface.
+function isWithinByteLimit(s, max) {
+  return utf8ByteLength(String(s || "")) <= max
+}
+
 // Bounded regex cache for highlightHtml, keyed by the lowercased query. A long
 // session could otherwise grow it without bound; once it reaches the cap the
 // cache is cleared whole (the compiled patterns are tiny and cheap to rebuild).

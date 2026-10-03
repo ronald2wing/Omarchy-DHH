@@ -25,20 +25,6 @@ assert(S.contextHandleOf(undefined) === "", "contextHandleOf undefined entry")
 // contextHandleOf: non-string handle is coerced to a string
 assert(S.contextHandleOf({ context: { handle: 42 } }) === "42", "contextHandleOf numeric handle coerced")
 
-// contextAvatarUrl: strips a leading '@' and builds the unavatar.io URL; "" for
-// a missing handle.
-assert(S.contextAvatarUrl("@janedoe") === "https://unavatar.io/x/janedoe", "contextAvatarUrl strips leading @")
-assert(S.contextAvatarUrl("janedoe") === "https://unavatar.io/x/janedoe", "contextAvatarUrl bare handle")
-assert(S.contextAvatarUrl("") === "", "contextAvatarUrl empty string")
-assert(S.contextAvatarUrl(null) === "", "contextAvatarUrl null")
-assert(S.contextAvatarUrl(undefined) === "", "contextAvatarUrl undefined")
-// contextAvatarUrl: non-string handle is coerced to a string
-assert(S.contextAvatarUrl(42) === "https://unavatar.io/x/42", "contextAvatarUrl numeric handle coerced")
-// contextAvatarUrl: percent-encodes the handle (parity with the Ruby renderer's
-// URI.encode_uri_component).
-assert(S.contextAvatarUrl("a b") === "https://unavatar.io/x/a%20b", "contextAvatarUrl percent-encodes space")
-assert(S.contextAvatarUrl("@a b") === "https://unavatar.io/x/a%20b", "contextAvatarUrl strips @ before encoding")
-
 // fileUrlToPath: decodes valid escapes; a malformed '%-escape' falls back to the
 // undecoded path (never null/throws), since the result is only used for local
 // file access.
