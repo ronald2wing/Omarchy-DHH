@@ -519,6 +519,7 @@ def main
        '--headless', '--disable-gpu', '--hide-scrollbars',
        "--user-data-dir=#{profile_dir}",
        '--no-first-run', '--no-default-browser-check', '--disable-extensions',
+       '--offline', '--host-resolver-rules=MAP * ~NOTFOUND',
        "--force-device-scale-factor=#{SCALE}",
        "--screenshot=#{tmp_raw}",
        "--window-size=#{window_size}",
