@@ -44,6 +44,12 @@ SCALE = 2
 # the 2x screenshot is 1200x676. The body is the full black card with no
 # surrounding dead canvas, so quotes skip trim_to_content.
 QUOTE_HEIGHT = 338
+# Process-supervisor deadlines. CHROMIUM_DEADLINE/MAGICK_DEADLINE are CLI-safety backstops only
+# and must stay above the panel's 15s QML watchdog; KILL_GRACE is the
+# TERM->KILL grace and must stay below it.
+CHROMIUM_DEADLINE = 30
+MAGICK_DEADLINE = 30
+KILL_GRACE = 2
 
 def data_uri(file, mime)
   "data:#{mime};base64,#{Base64.strict_encode64(File.binread(file))}"
@@ -317,6 +323,78 @@ def fallback_to_raw(raw_path, out_path)
   FileUtils.rm_f(raw_path)
 end
 
+# Process-group id of the running child, set by run_captured_group and read by
+# the TERM trap. `pgroup: true` makes the child its group's leader, so its pid
+# is its pgid. Only the main thread touches it (Ruby runs traps on the main
+# thread), so it needs no mutex.
+$active_child_pgid = nil
+
+# Sends -TERM to the child's process group, waits `grace` for it to exit via
+# the block (the watchdog joins the wait thread; the TERM trap sleeps, since it
+# holds no thread handle), then -KILLs the group if it is still alive. ESRCH on
+# either signal means the child already exited; nothing left to signal.
+def terminate_process_group(pgid, grace)
+  begin
+    Process.kill('-TERM', pgid)
+  rescue Errno::ESRCH
+    return
+  end
+
+  return unless yield(grace)
+
+  begin
+    Process.kill('-KILL', pgid)
+  rescue Errno::ESRCH
+    # Reaped during the grace window.
+  end
+end
+
+# Runs cmd in its own process group with a hard wall-clock deadline and a
+# SIGTERM grace window: on timeout the whole group is signalled -TERM, then
+# -KILL after grace, and reaped. stdout/stderr are drained on reader threads
+# (joined in an ensure) so a full pipe can never deadlock the child. Returns
+# [stdout, stderr, status, killed]. CLI-safety backstop only — the panel's 15s
+# watchdog fires first on the UI path, so deadline must stay above it.
+def run_captured_group(cmd, deadline:, grace:)
+  killed = false
+  stdout = +''
+  stderr = +''
+  status = nil
+
+  Open3.popen3(*cmd, pgroup: true) do |stdin, out, err, wait_thr|
+    stdin.close
+    pid = wait_thr.pid
+    $active_child_pgid = pid
+
+    out_t = Thread.new { out.read }
+    err_t = Thread.new { err.read }
+
+    watchdog = Thread.new do
+      next if wait_thr.join(deadline)
+
+      killed = true
+      terminate_process_group(pid, grace) { |g| !wait_thr.join(g) }
+    end
+    watchdog.join
+
+    begin
+      stdout = out_t.value
+      stderr = err_t.value
+    ensure
+      out_t.join
+      err_t.join
+      out.close
+      err.close
+    end
+
+    status = wait_thr.value
+  ensure
+    $active_child_pgid = nil
+  end
+
+  [stdout, stderr, status, killed]
+end
+
 # Trims the raw render down to the post. The template renders the post tall on
 # a dead black canvas with its own 12px/16px CSS padding and no trailing
 # divider, so only the dead canvas below the content is cropped: `-trim` with
@@ -328,18 +406,20 @@ end
 # render (uniform black), falls back to the raw render so the user still gets a
 # full PNG rather than nothing.
 def trim_to_content(raw_path, out_path)
-  box, _err, status = begin
-    Open3.capture3(
-      MAGICK, raw_path, '-format', '%@', '-write', 'info:',
-      '-background', 'black', '-define', 'trim:edges=south',
-      '-trim', '+repage', out_path
+  box, _err, status, killed = begin
+    run_captured_group(
+      [MAGICK, raw_path, '-format', '%@', '-write', 'info:',
+       '-background', 'black', '-define', 'trim:edges=south',
+       '-trim', '+repage', out_path],
+      deadline: MAGICK_DEADLINE, grace: KILL_GRACE
     )
   rescue StandardError
-    ['', nil, nil]
+    ['', nil, nil, false]
   end
 
   m = box.to_s.strip.match(/\A(\d+)x(\d+)\+(-?\d+)\+(-?\d+)\z/)
-  unless status&.success? && m
+  ok = !killed && status&.success? && m
+  unless ok
     # A failed magick may leave a partial file behind; remove it before copying
     # the raw render over it.
     FileUtils.rm_f(out_path)
@@ -406,16 +486,18 @@ def main
     # Posts render tall then trim to content; quotes render at their fixed
     # 16:9 card size and need no trim.
     window_size = is_quote ? "#{WIDTH},#{QUOTE_HEIGHT}" : "#{WIDTH},#{RENDER_HEIGHT}"
-    status = Open3.capture3(
-      CHROMIUM,
-      '--headless', '--disable-gpu', '--hide-scrollbars',
-      "--user-data-dir=#{profile_dir}",
-      '--no-first-run', '--no-default-browser-check', '--disable-extensions',
-      "--force-device-scale-factor=#{SCALE}",
-      "--screenshot=#{tmp_raw}",
-      "--window-size=#{window_size}",
-      "file://#{tmp_html}"
-    ).last
+    _out, _err, status, killed = run_captured_group(
+      [CHROMIUM,
+       '--headless', '--disable-gpu', '--hide-scrollbars',
+       "--user-data-dir=#{profile_dir}",
+       '--no-first-run', '--no-default-browser-check', '--disable-extensions',
+       "--force-device-scale-factor=#{SCALE}",
+       "--screenshot=#{tmp_raw}",
+       "--window-size=#{window_size}",
+       "file://#{tmp_html}"],
+      deadline: CHROMIUM_DEADLINE, grace: KILL_GRACE
+    )
+    raise 'chromium timed out' if killed
     raise "chromium exited #{status.exitstatus}" unless status.success?
 
     if is_quote
@@ -447,4 +529,25 @@ def main
   end
 end
 
-main
+# TERM trap body: signal the active child's whole process group (not just the
+# child), escalating -TERM to -KILL after KILL_GRACE so a TERM-ignoring child
+# cannot outlive the render; then `exit` (not `exit!`) so every ensure — including
+# FileUtils.rm_rf(tmp_dir) — still runs. Trap-safe only: Process.kill, sleep, and
+# the main-thread $active_child_pgid read (Mutex, Thread#join/value, and Queue#pop
+# are illegal in trap context).
+def handle_term
+  pgid = $active_child_pgid
+  terminate_process_group(pgid, KILL_GRACE) { |g| sleep(g) } if pgid
+  exit 1
+end
+
+# A separate method so the trap-path test installs the exact production handler
+# instead of duplicating the wiring.
+def install_term_handler
+  Signal.trap('TERM') { handle_term }
+end
+
+if __FILE__ == $PROGRAM_NAME
+  install_term_handler
+  main
+end
