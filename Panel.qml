@@ -40,6 +40,10 @@ Panel {
   property bool workerReady: false
   property bool workerInitSent: false
   property int workerInitRetries: 0
+  // Drives the unfollow confirmation modal; unfollowing is destructive (drops
+  // the account from the Following timeline) so it routes through a modal,
+  // while re-following stays an instant pill click.
+  property bool showUnfollowDialog: false
 
   // Result cap passed to the worker; _scan clamps it to 40 and a capped scan is
   // labeled "<maxResults>+ results" in the status line.
@@ -66,12 +70,18 @@ Panel {
   // X dark-mode palette + action-icon size, kept in sync with the render
   // script's inline CSS (bin/omarchy-dhh-render): .handle/.count fill #71767B,
   // .quote-container border #2F3336, .post-body/.name text #E7E9EA.
-  // Resting search ring matches X's muted #536471 (panel-only).
+  // X's muted border grey (#536471, the light-secondary token). The resting
+  // search ring and the outlined "Following" pill both use it.
   // .action-icon is 18.75px square.
   readonly property color xGray: "#71767B"
   readonly property color xDivider: "#2F3336"
   readonly property color xText: "#E7E9EA"
-  readonly property color xSearchRing: "#536471"
+  readonly property color xMutedBorder: "#536471"
+  // X's light action button (the filled "Follow" pill and the modal's primary
+  // button): #EFF3F4 fill, #0F1419 label, #D7DBDC on hover.
+  readonly property color xActionFill: "#EFF3F4"
+  readonly property color xActionFillHover: "#D7DBDC"
+  readonly property color xActionLabel: "#0F1419"
   // X's unfollow hover red, mirroring the "Unfollow" pill state on x.com.
   readonly property color xDanger: "#F4212E"
   readonly property real xActionIconSize: Style.spaceReal(18.75)
@@ -770,35 +780,49 @@ Panel {
           }
 
           // x.com "Following" pill, shown only once content has scrolled beneath
-          // the header (mirroring the real scrolled profile header). The pill is
-          // display-only; the header itself scrolls the body to the top.
+          // the header (mirroring the real scrolled profile header). Clicking it
+          // toggles between the outlined Following pill and a filled Follow
+          // button; the state is display-only and resets on shell restart.
           Rectangle {
+            id: followingPill
+
+            property bool following: true
+            readonly property bool hovered: followPillMouse.containsMouse
+            // x.com pads the label 16px each side in both states, so the width
+            // follows the text; only the longer Following/Unfollow label gets
+            // the 106px floor.
+            readonly property real labelWidth: followingLabel.implicitWidth + Style.space(32)
+
             visible: bodyScroll.contentY >= root.headerCollapseThreshold
             Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+            Layout.preferredHeight: Style.space(36)
             // Drive geometry through the layout: inside a RowLayout the engine
             // owns each item's width, so a raw `width` binding is ignored and
             // the pill keeps its stale slot (left-aligned) when the row
-            // re-solves. The 106px floor mirrors x.com's Following pill, whose
-            // label is narrower than the button's min-width.
-            Layout.preferredHeight: Style.space(36)
-            Layout.preferredWidth: Math.max(Style.space(106), followingLabel.implicitWidth + Style.space(32))
+            // re-solves.
+            Layout.preferredWidth: following ? Math.max(Style.space(106), labelWidth) : labelWidth
             radius: Layout.preferredHeight / 2
-            color: "transparent"
-            border.width: 1
-            border.color: followPillMouse.containsMouse ? root.xDanger : root.xGray
+            color: following ? "transparent" : root.xActionFill
+            border.width: following ? 1 : 0
+            border.color: hovered ? root.xDanger : root.xMutedBorder
 
             MouseArea {
               id: followPillMouse
               anchors.fill: parent
               hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: {
+                if (followingPill.following) root.showUnfollowDialog = true
+                else followingPill.following = true
+              }
             }
 
             Text {
               id: followingLabel
               anchors.centerIn: parent
-              text: followPillMouse.containsMouse ? "Unfollow" : "Following"
+              text: followingPill.following ? (followingPill.hovered ? "Unfollow" : "Following") : "Follow"
               textFormat: Text.PlainText
-              color: followPillMouse.containsMouse ? root.xDanger : root.xText
+              color: followingPill.following ? (followingPill.hovered ? root.xDanger : root.xText) : root.xActionLabel
               font.family: root.textFontFamily
               font.pixelSize: 15
               font.weight: Font.DemiBold
@@ -877,7 +901,7 @@ Panel {
                 radius: height / 2
                 color: Util.alpha(root.barForeground, 0.08)
                 border.width: 1
-                border.color: searchField.activeFocus ? root.xAccent : root.xSearchRing
+                border.color: searchField.activeFocus ? root.xAccent : root.xMutedBorder
               }
               onTextChanged: {
                 root.query = text
@@ -1198,6 +1222,140 @@ Panel {
             font.family: root.textFontFamily
             font.pixelSize: Style.font.bodySmall
             wrapMode: Text.WordWrap
+          }
+        }
+      }
+
+      // Unfollow confirmation modal, filling the panel card (a sibling of the
+      // header/body above, so it dims them too). The dim rides on this layer's
+      // own `color` alpha, NOT `opacity`, which would multiply down into the
+      // card and wash it out; the card draws above it. Every exit path clears
+      // root.showUnfollowDialog.
+      Rectangle {
+        anchors.fill: parent
+        visible: root.showUnfollowDialog
+        z: 100
+        color: Util.alpha("#000000", 0.4)
+
+        // Scrim click cancels; the card swallows its own clicks below.
+        MouseArea {
+          anchors.fill: parent
+          onClicked: root.showUnfollowDialog = false
+        }
+
+        // Grabs keyboard focus while open so typing cannot leak to the search
+        // field behind the modal. Esc rides on a window-wide Shortcut: the
+        // panel's keyCatcher can steal active focus, which defeats a Keys
+        // handler.
+        FocusScope {
+          anchors.fill: parent
+          focus: root.showUnfollowDialog
+
+          Shortcut {
+            enabled: root.showUnfollowDialog
+            sequence: "Escape"
+            onActivated: root.showUnfollowDialog = false
+          }
+        }
+
+        Rectangle {
+          anchors.centerIn: parent
+          width: Style.space(320)
+          height: unfollowColumn.implicitHeight + Style.space(24) * 2
+          radius: Style.space(16)
+          color: "#000000"
+
+          // Swallows clicks so they never fall through to the scrim's cancel.
+          MouseArea { anchors.fill: parent }
+
+          ColumnLayout {
+            id: unfollowColumn
+            anchors.fill: parent
+            anchors.margins: Style.space(24)
+            spacing: Style.space(16)
+
+            Text {
+              Layout.fillWidth: true
+              text: "Unfollow @dhh?"
+              textFormat: Text.PlainText
+              color: root.xText
+              font.family: root.textFontFamily
+              font.pixelSize: 20
+              font.weight: Font.Bold
+              wrapMode: Text.WordWrap
+            }
+
+            Text {
+              Layout.fillWidth: true
+              text: "Their posts will no longer show up in your Following timeline. You can still view their profile, unless their posts are protected."
+              textFormat: Text.PlainText
+              color: root.xGray
+              font.family: root.textFontFamily
+              font.pixelSize: 15
+              wrapMode: Text.WordWrap
+            }
+
+            // Primary action: the destructive unfollow. Flips the pill to its
+            // filled Follow state and closes the modal.
+            Rectangle {
+              Layout.fillWidth: true
+              Layout.preferredHeight: Style.space(44)
+              radius: height / 2
+              // x.com darkens the light action fill on hover; the label keeps
+              // its colour.
+              color: unfollowButtonMouse.containsMouse ? root.xActionFillHover : root.xActionFill
+
+              MouseArea {
+                id: unfollowButtonMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  followingPill.following = false
+                  root.showUnfollowDialog = false
+                }
+              }
+
+              Text {
+                anchors.centerIn: parent
+                text: "Unfollow"
+                textFormat: Text.PlainText
+                color: root.xActionLabel
+                font.family: root.textFontFamily
+                font.pixelSize: 15
+                font.weight: Font.Bold
+              }
+            }
+
+            // Secondary action: dismiss without changing follow state.
+            Rectangle {
+              Layout.fillWidth: true
+              Layout.preferredHeight: Style.space(44)
+              radius: height / 2
+              // x.com lays a 10% action-fill overlay on hover; the border and
+              // label stay put.
+              color: cancelButtonMouse.containsMouse ? Util.alpha(root.xActionFill, 0.1) : "transparent"
+              border.width: 1
+              border.color: root.xMutedBorder
+
+              MouseArea {
+                id: cancelButtonMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.showUnfollowDialog = false
+              }
+
+              Text {
+                anchors.centerIn: parent
+                text: "Cancel"
+                textFormat: Text.PlainText
+                color: root.xText
+                font.family: root.textFontFamily
+                font.pixelSize: 15
+                font.weight: Font.Bold
+              }
+            }
           }
         }
       }
