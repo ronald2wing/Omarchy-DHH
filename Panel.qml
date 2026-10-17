@@ -633,6 +633,41 @@ Panel {
           opacity: bodyScroll.contentY >= root.headerCollapseThreshold ? 1 : 0
         }
 
+        // Full-header catcher: clicking anywhere on the bar (outside the
+        // buttons) scrolls the body to the top. Declared before the layout so
+        // every header button, whose own MouseArea takes precedence, still
+        // receives its clicks.
+        MouseArea {
+          anchors.fill: parent
+          cursorShape: Qt.PointingHandCursor
+          onClicked: {
+            bodyScroll.cancelFlick()
+            topScrollAnimation.restart()
+          }
+        }
+
+        // Halo around the back arrow: swallows clicks just outside the button
+        // so a near-miss on Close does not scroll the body. Positioned from the
+        // layout's own margins and the button's size, so it tracks them instead
+        // of restating their values. Sits above the catcher, below the layout.
+        MouseArea {
+          x: headerLayout.leftMargin - Style.spacing.sm
+          y: headerLayout.anchors.topMargin - Style.spacing.sm
+          width: backButton.width + 2 * Style.spacing.sm
+          height: backButton.height + 2 * Style.spacing.sm
+        }
+
+        // Scoped to the header: a global Behavior on contentY would also
+        // animate moveSelection()'s incremental writes and user flicks.
+        NumberAnimation {
+          id: topScrollAnimation
+          target: bodyScroll
+          property: "contentY"
+          to: 0
+          duration: 200
+          easing.type: Easing.OutCubic
+        }
+
         // Header: back arrow, name + verified badge + post count, then random
         // and search actions flush right. The identity column fills the
         // remaining width, pushing the two action buttons to the far right. On
@@ -656,6 +691,7 @@ Panel {
 
           // Back arrow: closes the popup (same path as the Esc handler).
           HeaderIconButton {
+            id: backButton
             source: root.backIconSource
             tooltip: "Close"
             panelForeground: root.xText
@@ -734,8 +770,8 @@ Panel {
           }
 
           // x.com "Following" pill, shown only once content has scrolled beneath
-          // the header (mirroring the real scrolled profile header). Tapping it
-          // returns the body to the top.
+          // the header (mirroring the real scrolled profile header). The pill is
+          // display-only; the header itself scrolls the body to the top.
           Rectangle {
             visible: bodyScroll.contentY >= root.headerCollapseThreshold
             Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
@@ -755,25 +791,6 @@ Panel {
               id: followPillMouse
               anchors.fill: parent
               hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: {
-                // Cancel an in-flight flick so the animation isn't fighting
-                // momentum, then restart from the current offset.
-                bodyScroll.cancelFlick()
-                topScrollAnimation.stop()
-                topScrollAnimation.start()
-              }
-            }
-
-            // Scoped to the pill: a global Behavior on contentY would also
-            // animate moveSelection()'s incremental writes and user flicks.
-            NumberAnimation {
-              id: topScrollAnimation
-              target: bodyScroll
-              property: "contentY"
-              to: 0
-              duration: 200
-              easing.type: Easing.OutCubic
             }
 
             Text {
@@ -801,7 +818,7 @@ Panel {
         contentHeight: root.contentTotalHeight
         boundsBehavior: Flickable.StopAtBounds
         interactive: contentHeight > height
-        // A user drag takes over from the pill's top-scroll animation.
+        // A user drag takes over from the header's scroll-to-top animation.
         onMovementStarted: topScrollAnimation.stop()
         QQC.ScrollBar.vertical: QQC.ScrollBar { policy: QQC.ScrollBar.AsNeeded }
 
