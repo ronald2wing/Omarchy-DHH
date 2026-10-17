@@ -738,10 +738,15 @@ Panel {
           // returns the body to the top.
           Rectangle {
             visible: bodyScroll.contentY >= root.headerCollapseThreshold
-            Layout.alignment: Qt.AlignVCenter
-            height: 36
-            width: followingLabel.implicitWidth + Style.space(32)
-            radius: height / 2
+            Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+            // Drive geometry through the layout: inside a RowLayout the engine
+            // owns each item's width, so a raw `width` binding is ignored and
+            // the pill keeps its stale slot (left-aligned) when the row
+            // re-solves. The 106px floor mirrors x.com's Following pill, whose
+            // label is narrower than the button's min-width.
+            Layout.preferredHeight: Style.space(36)
+            Layout.preferredWidth: Math.max(Style.space(106), followingLabel.implicitWidth + Style.space(32))
+            radius: Layout.preferredHeight / 2
             color: "transparent"
             border.width: 1
             border.color: followPillMouse.containsMouse ? root.xDanger : root.xGray
