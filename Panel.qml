@@ -45,6 +45,28 @@ Panel {
   // while re-following stays an instant pill click.
   property bool showUnfollowDialog: false
 
+  // Random-feed state. On the empty-query page the feed shows history (max 20,
+  // most-recent-first) followed by random ephemeral posts that stream in as the
+  // user scrolls. A random post is persisted only when the user copies or
+  // renders it — it then joins history and leaves the feed.
+  //
+  // feedKeys holds the content key of each random row currently in the feed; it
+  // drives the no-repeat check when a batch is requested and received. History
+  // keys are recomputed from service.history on demand, not tracked here.
+  property var feedKeys: []
+  property bool feedLoading: false
+  readonly property int feedBatchSize: 12
+  // Rows the worker has returned but the feed has not laid out yet. The worker
+  // answers faster than a batch renders, so appending a whole batch at once
+  // stalls the render thread. Rows queue here instead and drain a small slice
+  // per turn (feedDrainTimer), keeping the scroll live while they land.
+  property var pendingFeedRows: []
+  readonly property int feedDrainSlice: 2
+  // How close to the feed's end, as a fraction of the viewport, the scroll must
+  // come before the next batch is requested. A fraction rather than a fixed
+  // height keeps the buffer bounded however tall the rows are.
+  readonly property real feedPreloadFactor: 0.5
+
   // Result cap passed to the worker; _scan clamps it to 40 and a capped scan is
   // labeled "<maxResults>+ results" in the status line.
   readonly property int maxResults: 37
@@ -172,7 +194,12 @@ Panel {
   function close() { controller.hide() }
 
   onOpenedChanged: {
-    if (!root.opened && root.service) {
+    if (root.opened) {
+      // Reset the feed on open so stale ephemeral entries from a prior session
+      // don't linger, then seed history and start streaming.
+      root.resetFeed()
+      if (root.query.trim() === "" && root.workerReady) root.requestFeedBatch()
+    } else if (root.service) {
       root.service.cancelPostCountFetch()
       root.service.cancelAvatarFetch()
     }
@@ -223,7 +250,14 @@ Panel {
   function runSearch() {
     resultModel.clear()
     root.suggestions = []
-    if (root.query.trim() === "") { root.statusMessage = ""; return }
+    if (root.query.trim() === "") {
+      root.statusMessage = ""
+      // Empty query: reset the feed to current history and start streaming
+      // random posts.
+      root.resetFeed()
+      if (root.workerReady) root.requestFeedBatch()
+      return
+    }
     // Connections may miss datasetLoadedChanged if service loads before
     // Panel receives the injection; retry the init handshake here so the
     // user never sees a perpetual "Loading dataset…".
@@ -368,6 +402,80 @@ Panel {
     searchWorker.sendMessage({ type: "random" })
   }
 
+  // Content identity of a feed entry, shared by history and feed rows: the
+  // source string, falling back to body text. Ids are unreliable, so no-repeat
+  // dedup keys on content only. Mirrors contentKey in SearchWorker.js.
+  function feedContentKey(entry) {
+    return String((entry && entry.source) || (entry && entry.text) || "")
+  }
+
+  // Clear the ephemeral feed and reseed the model from history alone.
+  function resetFeed() {
+    root.feedKeys = []
+    root.pendingFeedRows = []
+    feedDrainTimer.stop()
+    root.seedFeedFromHistory()
+  }
+
+  // Keys the feed must never repeat: every history key (so the worker cannot
+  // return an already-saved post) plus every key already in the feed.
+  function feedExcludedKeys() {
+    const history = root.service && root.service.history ? root.service.history : []
+    const keys = Object.create(null)
+    for (let i = 0; i < history.length; i++) keys[root.feedContentKey(history[i])] = true
+    for (let j = 0; j < root.feedKeys.length; j++) keys[root.feedKeys[j]] = true
+    return Object.keys(keys)
+  }
+
+  // One feedModel row for an entry: the entry plus its precomputed body HTML.
+  // The feed page has no query, so highlightHtml only escapes the text. Shared
+  // by the rebuild and the incremental append so both yield identical rows.
+  function feedRow(entry) {
+    return {
+      entry: entry,
+      textHtml: Fmt.highlightHtml(Search.stripLeadingMentions(entry.text, Search.contextHandleOf(entry)), "")
+    }
+  }
+
+  // Seed feedModel from history (max 20, most-recent-first). Batches append
+  // random rows on top; a post joins history (on copy/render) via a reset, so
+  // the only way it appears twice is impossible by construction.
+  function seedFeedFromHistory() {
+    feedModel.clear()
+    const history = root.service && root.service.history ? root.service.history.slice(0, 20) : []
+    const rows = []
+    for (let i = 0; i < history.length; i++) rows.push(root.feedRow(history[i]))
+    feedModel.append(rows)
+  }
+
+  // Ask the worker for the next batch of random entries. The empty-query page
+  // must be showing, no request may be in flight, the previous batch must have
+  // drained, and the worker must be ready — so the queue stays bounded.
+  function requestFeedBatch() {
+    if (root.query.trim() !== "") return
+    if (root.feedLoading) return
+    if (root.pendingFeedRows.length > 0) return
+    if (!root.workerReady) return
+    root.feedLoading = true
+    searchWorker.sendMessage({
+      type: "randomBatch",
+      count: root.feedBatchSize,
+      excludeKeys: root.feedExcludedKeys()
+    })
+  }
+
+  // Scroll trigger: once the viewport bottom is within feedPreloadFactor of the
+  // feed's end, request the next batch so a cushion always sits below the fold.
+  function preloadFeedIfNeeded() {
+    if (feedModel.count === 0) return
+    // Viewport bottom in feedScroll's coordinates; feedScroll is sized to its
+    // full contentHeight, so this maps onto the feed's content axis.
+    const viewportBottom = feedScroll.mapFromItem(bodyScroll, 0, bodyScroll.height).y
+    const remaining = feedScroll.contentHeight - viewportBottom
+    if (remaining > bodyScroll.height * root.feedPreloadFactor) return
+    root.requestFeedBatch()
+  }
+
   // Open the entry's source URL in the default browser (the "..." / more
   // action on each result row). Same detached-exec pattern as openRenderOutputFolder.
   function openEntrySource(entry) {
@@ -402,11 +510,35 @@ Panel {
 
   ListModel { id: resultModel }
 
+  // Feed rows: history (most-recent-first) then random ephemeral posts, in the
+  // same shape as resultModel ({ entry, textHtml }).
+  ListModel { id: feedModel }
+
   Timer {
     id: searchTimer
     interval: 80
     repeat: false
     onTriggered: root.runSearch()
+  }
+
+  // Drains pendingFeedRows into feedModel a slice per frame. The 16ms interval
+  // lets input and scrolling interleave between slices, so the panel stays live
+  // while the queue lands instead of stalling on one whole-batch append.
+  Timer {
+    id: feedDrainTimer
+    interval: 16
+    repeat: true
+    onTriggered: {
+      if (root.pendingFeedRows.length === 0) { stop(); return }
+      feedModel.append(root.pendingFeedRows.slice(0, root.feedDrainSlice))
+      root.pendingFeedRows = root.pendingFeedRows.slice(root.feedDrainSlice)
+      // Once drained, re-check the trigger: a batch that arrived while the user
+      // sat at the bottom should start the next request immediately.
+      if (root.pendingFeedRows.length === 0) {
+        stop()
+        root.preloadFeedIfNeeded()
+      }
+    }
   }
 
   Timer {
@@ -478,6 +610,13 @@ Panel {
         initWatchdog.stop()
         // Release the retained dataset now that the worker holds its own copy.
         if (root.service) root.service.datasetRaw = ""
+
+        // On the empty-query page with the panel open, seed the feed from
+        // history and start streaming random posts.
+        if (root.opened && root.query.trim() === "") {
+          root.resetFeed()
+          root.requestFeedBatch()
+        }
         return
       }
       if (msg.type === "trending") {
@@ -487,6 +626,31 @@ Panel {
       if (msg.type === "random") {
         if (msg.entry) root.renderEntry(msg.entry)
         else root.showToast("No entries")
+        return
+      }
+      if (msg.type === "randomBatch") {
+        root.feedLoading = false
+        const batch = msg.batch || []
+        if (batch.length === 0) return
+        // The worker already dropped excluded keys; re-check in case the feed
+        // state moved on while the reply was in flight.
+        const known = Object.create(null)
+        for (let i = 0; i < root.feedKeys.length; i++) known[root.feedKeys[i]] = true
+        const rows = []
+        for (let j = 0; j < batch.length; j++) {
+          const key = root.feedContentKey(batch[j])
+          if (known[key]) continue
+          known[key] = true
+          root.feedKeys.push(key)
+          rows.push(root.feedRow(batch[j]))
+        }
+        if (rows.length === 0) return
+        // Queue rather than append: a whole batch appended in one turn makes the
+        // render thread lay out every new delegate at once and stalls the panel.
+        // feedDrainTimer spreads that cost across turns.
+        root.pendingFeedRows = root.pendingFeedRows.concat(rows)
+        feedDrainTimer.start()
+        if (root.service) root.service.fetchAvatars(root.avatarHandlesFor(batch))
         return
       }
       if (msg.query !== root.query) return
@@ -522,6 +686,14 @@ Panel {
     // search message.
     function onDatasetLoadedChanged() {
       if (root.service && root.service.datasetLoaded) root.ensureWorkerInit()
+    }
+    // On history change (a feed post was copied or rendered), rebuild the feed
+    // so the saved entry leaves the random stream and appears in history. Guard
+    // on opened so the feed is not rebuilt while the panel is hidden.
+    function onHistoryChanged() {
+      if (!root.opened) return
+      root.resetFeed()
+      if (root.query.trim() === "" && root.workerReady) root.requestFeedBatch()
     }
   }
 
@@ -844,6 +1016,11 @@ Panel {
         interactive: contentHeight > height
         // A user drag takes over from the header's scroll-to-top animation.
         onMovementStarted: topScrollAnimation.stop()
+
+        // Infinite scroll: request the next batch once the viewport nears the
+        // feed's end. preloadFeedIfNeeded owns the threshold and the guards.
+        onContentYChanged: root.preloadFeedIfNeeded()
+        onAtYEndChanged: { if (atYEnd) root.preloadFeedIfNeeded() }
         QQC.ScrollBar.vertical: QQC.ScrollBar { policy: QQC.ScrollBar.AsNeeded }
 
         // Full-surface click-catcher, declared FIRST so it sits at the bottom
@@ -1079,33 +1256,43 @@ Panel {
 
           FullBleed {
             fullWidth: bodyScroll.width
-            visible: root.query.trim() === "" && root.service && root.service.history.length > 0
+            // Visible when the feed has at least one row (history entries or
+            // random posts) on the empty-query page.
+            visible: root.query.trim() === "" && feedModel.count > 0
             spacing: Style.spacing.xxs
 
             HairlineDivider { color: root.xDivider }
 
-            // History list. Eager Repeater (not a ListView): the outer
-            // bodyScroll Flickable handles scrolling, so a ListView would add
-            // unused scroll machinery for zero benefit. Most-recent-first order.
-            Repeater {
-              model: root.query.trim() === "" ? (root.service && root.service.history ? root.service.history : []) : []
+            // The feed: history (most-recent-first) then random ephemeral posts.
+            // A ListView rather than a Repeater so batches can append without
+            // destroying and recreating the cards already shown. It does not
+            // scroll itself — outer bodyScroll owns scrolling — and is sized to
+            // its contentHeight so bodyScroll's content grows with it.
+            ListView {
+              id: feedScroll
+              width: parent.width
+              height: Math.max(Style.space(96), contentHeight)
+              clip: true
+              model: feedModel
+              spacing: 0
+              boundsBehavior: Flickable.StopAtBounds
 
               delegate: PostCard {
-                required property var modelData
+                // `entry` and `textHtml` are PostCard's own required properties,
+                // auto-filled from the same-named model roles.
                 required property int index
 
                 panel: root
-                entry: modelData
-                textHtml: Fmt.highlightHtml(Search.stripLeadingMentions(modelData.text, Search.contextHandleOf(modelData)), "")
-                selectOnHover: false
+                cardIndex: index
                 selected: false
+                selectOnHover: false
                 cardWidth: bodyScroll.width
-                renderBusy: root.renderingEntryText !== "" && modelData && modelData.text === root.renderingEntryText
-                showDivider: index < root.service.history.length - 1
+                renderBusy: root.renderingEntryText !== "" && entry && entry.text === root.renderingEntryText
+                showDivider: index < feedModel.count - 1
 
-                onCopyRequested: root.copyEntry(modelData)
-                onRenderRequested: root.renderEntry(modelData)
-                onSourceRequested: root.openEntrySource(modelData)
+                onCopyRequested: root.copyEntry(entry)
+                onRenderRequested: root.renderEntry(entry)
+                onSourceRequested: root.openEntrySource(entry)
                 onDismissRequested: root.dismissSearch()
               }
             }

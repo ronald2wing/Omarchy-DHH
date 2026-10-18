@@ -35,6 +35,34 @@ function pickEntryForItem(item, id) {
   return pickEntry(Object.assign({}, item.entry, { text: originalItemText(item) }), id)
 }
 
+// Content identity of an entry: its source string, falling back to body text.
+// Entry ids are unreliable (random draws have none; history ids may be numeric
+// or a string hash), so the feed's no-repeat invariant keys on content only.
+// Mirrors Panel.qml's feedContentKey; both sides must agree.
+function contentKey(e) {
+  return String((e && e.source) || (e && e.text) || "")
+}
+
+// Draw `count` random entries that avoid every excluded key and do not repeat
+// within the batch. Bounded rejection sampling: at most count*8 draws, so a
+// small dataset whose entries are mostly excluded cannot spin forever.
+function drawRandomBatch(count, excludedKeys) {
+  const excluded = Object.create(null)
+  for (let i = 0; i < excludedKeys.length; i++) excluded[excludedKeys[i]] = true
+  const batch = []
+  const seen = Object.create(null)
+  const maxDraws = count * 8
+  for (let draws = 0; draws < maxDraws && batch.length < count; draws++) {
+    const item = lowerEntries[Math.floor(Math.random() * lowerEntries.length)]
+    const entry = pickEntryForItem(item)
+    const key = contentKey(entry)
+    if (excluded[key] || seen[key]) continue
+    batch.push(entry)
+    seen[key] = true
+  }
+  return batch
+}
+
 WorkerScript.onMessage = function(msg) {
   // The worker may get internal QML messages without our expected keys;
   // drop anything that isn't an explicit init or search request.
@@ -108,6 +136,14 @@ WorkerScript.onMessage = function(msg) {
       type: "random",
       entry: item ? pickEntryForItem(item) : null
     })
+    return
+  }
+  if (msg.type === "randomBatch") {
+    const count = Math.max(1, Math.min(msg.count || 12, 50))
+    const batch = lowerEntries && lowerEntries.length
+      ? drawRandomBatch(count, msg.excludeKeys || [])
+      : []
+    WorkerScript.sendMessage({ type: "randomBatch", batch: batch })
     return
   }
   if (msg.type !== "search") return
