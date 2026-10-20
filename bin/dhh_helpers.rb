@@ -156,6 +156,7 @@ module DHHFetch
   # response without a Content-Length cannot balloon memory.
   MAX_AVATAR_BYTES = 1_048_576
   MIME_ALLOWLIST = %r{\Aimage/(png|jpe?g|gif|webp)\z}
+  PNG_SIGNATURE = "\x89PNG\r\n\x1a\n".b.freeze
   class BodyTooLarge < StandardError; end
 
   def self.read_capped_body(response, max_bytes:)
@@ -176,8 +177,38 @@ module DHHFetch
     MIME_ALLOWLIST.match?(mime) ? mime : 'image/png'
   end
 
+  # Strips the zTXt/iTXt/iCCP chunks from a PNG byte stream. libpng expands each
+  # up to its 8 MB per-chunk malloc cap and Qt retains every expanded chunk, so
+  # a sub-1 MiB avatar can force multi-GB allocations in the shell. Avatars never
+  # need these chunks. Non-PNG bytes pass through; a PNG that does not walk
+  # cleanly returns nil so the caller fails the fetch — bytes a decoder tolerates
+  # must never bypass this.
+  def self.strip_png_bomb_chunks(bytes)
+    data = bytes.b
+    return bytes unless data.start_with?(PNG_SIGNATURE)
+
+    out = PNG_SIGNATURE.dup
+    pos = PNG_SIGNATURE.bytesize
+    loop do
+      remaining = data.bytesize - pos
+      return nil if remaining < 12
+
+      total = data.byteslice(pos, 4).unpack1('N') + 12
+      return nil if total > remaining
+
+      type = data.byteslice(pos + 4, 4)
+      out << data.byteslice(pos, total) unless %w[zTXt iTXt iCCP].include?(type)
+      pos += total
+      break if type == 'IEND'
+    end
+    pos == data.bytesize ? out : nil
+  end
+
+  # Base64 data URI for fetched (untrusted) image bytes, stripped first; local
+  # trusted assets use data_uri directly. Nil when a PNG fails to parse.
   def self.image_data_uri(content_type, bytes)
-    data_uri(normalized_image_mime(content_type), bytes)
+    stripped = strip_png_bomb_chunks(bytes)
+    stripped && data_uri(normalized_image_mime(content_type), stripped)
   end
 
   # Returns the block's value on 2xx, nil on any failure.
