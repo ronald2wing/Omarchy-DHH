@@ -1,12 +1,14 @@
 # Contract tests for bin/omarchy-fetch-avatar: the streaming byte cap aborts a
 # chunked (Content-Length-less) download, the batch byte budget stops the batch,
 # timeouts and non-2xx fail closed, redirects never downgrade TLS, non-image
-# mimes are forced to png, invalid handles never reach the wire, and the
+# mimes are forced to png, PNG decompression-bomb chunks are stripped and
+# malformed PNGs fail closed, invalid handles never reach the wire, and the
 # wall-clock deadline bounds the whole batch. Stdlib only; every network hop hits
 # a loopback TCPServer, never an external host. Loading the script runs only its
 # definitions — the __FILE__ guard keeps main from executing.
 
 require 'socket'
+require 'zlib'
 
 load File.expand_path('../bin/omarchy-fetch-avatar', __dir__)
 
@@ -237,5 +239,38 @@ server.close
 thread.join
 count = mutex.synchronize { connections }
 assert(count < 4, "deadline stops the batch before all handles (#{count} < 4 connections)")
+
+# 10. Decompression-bomb PNG: compressed ancillary chunks are stripped before
+# the bytes become a data URI, a clean PNG round-trips byte-identical, and a
+# PNG that does not parse is omitted from the batch (fail closed).
+# Chunk framer for the fixture PNGs: length + type + data + CRC.
+def png_chunk(type, data)
+  [data.bytesize].pack('N') + type + data + [Zlib.crc32(type + data)].pack('N')
+end
+
+png_sig = "\x89PNG\r\n\x1a\n".b
+ihdr_chunk = png_chunk('IHDR', [8, 8, 8, 2, 0, 0, 0].pack('NNC5'))
+iend_chunk = png_chunk('IEND', ''.b)
+clean_png = png_sig + ihdr_chunk + iend_chunk
+# zTXt with a ~1000x expansion payload — a multi-MB allocation if ever decoded.
+bomb_png = png_sig + ihdr_chunk +
+           png_chunk('zTXt', "Comment\x00\x00".b + Zlib::Deflate.deflate('B' * 500_000)) +
+           iend_chunk
+malformed_png = png_sig + 'not a chunk stream'
+bodies = { 'bomb' => bomb_png, 'clean' => clean_png }
+
+server, port, thread = accepting_server do |socket, req, _port|
+  handle = req.split(' ')[1].split('/').last
+  body = bodies.fetch(handle, malformed_png)
+  socket.write("HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: #{body.bytesize}\r\n\r\n#{body}")
+end
+
+result = fetch_avatar_batch(%w[bomb clean bad], **loopback(port))
+assert(result.keys.sort == %w[bomb clean], 'malformed PNG omitted from the batch')
+decode_uri = ->(uri) { uri.sub('data:image/png;base64,', '').unpack1('m0') }
+assert(decode_uri.call(result['bomb']) == clean_png, 'bomb PNG arrives with its zTXt chunk stripped')
+assert(decode_uri.call(result['clean']) == clean_png, 'clean PNG round-trips byte-identical')
+server.close
+thread.join
 
 puts 'test_avatar.rb: all assertions passed'

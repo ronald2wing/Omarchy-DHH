@@ -1,11 +1,13 @@
 # Contract tests for bin/dhh_helpers.rb, the Ruby port of format.js/search.js.
 # Mirrors the relevant assertions from tests/test_format.js and pins the
-# JS<->Ruby parity values. Stdlib only.
+# JS<->Ruby parity values. Also pins DHHFetch.strip_png_bomb_chunks, the PNG
+# decompression-bomb filter the avatar fetch boundary runs on every PNG. Stdlib only.
 #
 # Note the quirk this pins down: hash32 is the JS double-rounded FNV-1a (JS
 # multiplies with IEEE-754 doubles), NOT canonical FNV-1a — "abc" hashes to
 # 440920332 here instead of the canonical 440920331.
 
+require 'zlib'
 require_relative '../bin/dhh_helpers'
 
 def assert(cond, msg)
@@ -87,5 +89,51 @@ begin
 rescue NoMethodError
   # expected: no coercion in the Ruby port.
 end
+
+# ---- DHHFetch.strip_png_bomb_chunks / image_data_uri ----
+
+# Chunk framer: length + type + data + CRC (the wire shape the stripper walks).
+def png_chunk(type, data)
+  [data.bytesize].pack('N') + type + data + [Zlib.crc32(type + data)].pack('N')
+end
+
+png_sig = "\x89PNG\r\n\x1a\n".b
+ihdr_chunk = png_chunk('IHDR', [8, 8, 8, 2, 0, 0, 0].pack('NNC5'))
+iend_chunk = png_chunk('IEND', ''.b)
+text_chunk = png_chunk('tEXt', "Keep\x00value".b)
+clean_png = png_sig + ihdr_chunk + iend_chunk
+
+# Clean PNGs and non-PNG bytes pass through byte-identical; a bare signature
+# cannot be a valid stream and fails closed.
+assert(DHHFetch.strip_png_bomb_chunks(clean_png) == clean_png, 'strip: clean PNG unchanged')
+assert(DHHFetch.strip_png_bomb_chunks("\xff\xd8\xff\xe0jpeg".b) == "\xff\xd8\xff\xe0jpeg".b, 'strip: jpeg bytes unchanged')
+assert(DHHFetch.strip_png_bomb_chunks(png_sig).nil?, 'strip: signature-only PNG fails closed')
+
+# The three compressed chunk types are dropped — even with a payload that
+# would expand 1000x — while every other chunk survives byte-identically.
+bomb_png = png_sig + ihdr_chunk +
+           png_chunk('zTXt', "Comment\x00\x00".b + Zlib::Deflate.deflate('A' * 1_000_000)) +
+           png_chunk('iTXt', "k\x00\x00\x00\x00\x00text".b) +
+           png_chunk('iCCP', "prof\x00\x00".b + Zlib::Deflate.deflate('p' * 4_000)) +
+           text_chunk + iend_chunk
+expected_png = png_sig + ihdr_chunk + text_chunk + iend_chunk
+assert(DHHFetch.strip_png_bomb_chunks(bomb_png) == expected_png,
+       'strip: zTXt/iTXt/iCCP dropped, tEXt and framing byte-identical')
+
+# Malformed streams fail closed instead of passing unfiltered bytes through:
+# chunk overrun, missing IEND, trailing bytes after IEND.
+assert(DHHFetch.strip_png_bomb_chunks(png_sig + "\x00\x00\x00\x20zTXtshort".b).nil?,
+       'strip: chunk overrun fails closed')
+assert(DHHFetch.strip_png_bomb_chunks(png_sig + ihdr_chunk).nil?,
+       'strip: missing IEND fails closed')
+assert(DHHFetch.strip_png_bomb_chunks(clean_png + 'trailing junk').nil?,
+       'strip: trailing bytes after IEND fail closed')
+
+# image_data_uri strips before encoding and fails the whole conversion when a
+# PNG does not parse.
+assert(DHHFetch.image_data_uri('image/png', png_sig).nil?, 'image_data_uri: unparseable PNG returns nil')
+bomb_uri = DHHFetch.image_data_uri('image/png', bomb_png)
+assert(bomb_uri.is_a?(String) && bomb_uri.sub('data:image/png;base64,', '').unpack1('m0') == expected_png,
+       'image_data_uri: encodes the stripped bytes')
 
 puts 'test_helpers.rb: all assertions passed'
