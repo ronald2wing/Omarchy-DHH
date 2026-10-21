@@ -139,7 +139,7 @@ WorkerScript.onMessage = function(msg) {
     return
   }
   if (msg.type === "randomBatch") {
-    const count = Math.max(1, Math.min(msg.count || 12, 50))
+    const count = Math.max(1, Math.min(msg.count || 37, 50))
     const batch = lowerEntries && lowerEntries.length
       ? drawRandomBatch(count, msg.excludeKeys || [])
       : []

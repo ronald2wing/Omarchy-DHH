@@ -55,7 +55,7 @@ Panel {
   // keys are recomputed from service.history on demand, not tracked here.
   property var feedKeys: []
   property bool feedLoading: false
-  readonly property int feedBatchSize: 12
+  readonly property int feedBatchSize: 37
   // Rows the worker has returned but the feed has not laid out yet. The worker
   // answers faster than a batch renders, so appending a whole batch at once
   // stalls the render thread. Rows queue here instead and drain a small slice
