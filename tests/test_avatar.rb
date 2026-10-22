@@ -2,10 +2,11 @@
 # chunked (Content-Length-less) download, the batch byte budget stops the batch,
 # timeouts and non-2xx fail closed, redirects never downgrade TLS, non-image
 # mimes are forced to png, PNG decompression-bomb chunks are stripped and
-# malformed PNGs fail closed, invalid handles never reach the wire, and the
-# wall-clock deadline bounds the whole batch. Stdlib only; every network hop hits
-# a loopback TCPServer, never an external host. Loading the script runs only its
-# definitions — the __FILE__ guard keeps main from executing.
+# malformed PNGs fail closed, unread redirect/error bodies drain under the same
+# cap, invalid handles never reach the wire, and the wall-clock deadline bounds
+# the whole batch. Stdlib only; every network hop hits a loopback TCPServer,
+# never an external host. Loading the script runs only its definitions — the
+# __FILE__ guard keeps main from executing.
 
 require 'socket'
 require 'zlib'
@@ -272,5 +273,27 @@ assert(decode_uri.call(result['bomb']) == clean_png, 'bomb PNG arrives with its 
 assert(decode_uri.call(result['clean']) == clean_png, 'clean PNG round-trips byte-identical')
 server.close
 thread.join
+
+# 11. Unread response bodies: net/http drains a body left unread after the
+# response block, uncapped, so oversized redirect/error bodies must fail closed.
+{ '302 Found' => "Location: http://127.0.0.1:9/\r\n",
+  '500 Internal Server Error' => '' }.each do |status, extra|
+  port, thread = one_shot_server do |socket, _req|
+    socket.write("HTTP/1.1 #{status}\r\n#{extra}\r\n")
+    10_000.times do
+      socket.write('x' * 4096)
+      sleep 0.02
+    end
+  rescue Errno::EPIPE, Errno::ECONNRESET, IOError
+    # client aborted on the cap: expected
+  end
+
+  t0 = Time.now
+  result = fetch_one('drain', **loopback(port))
+  elapsed = Time.now - t0
+  assert(result.nil?, "#{status}: oversized body fails closed")
+  assert(elapsed < 2, "#{status}: cap aborts the drain (#{elapsed.round(2)}s)")
+  thread.join
+end
 
 puts 'test_avatar.rb: all assertions passed'
