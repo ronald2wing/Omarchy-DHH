@@ -1053,14 +1053,22 @@ Panel {
             topPadding: Style.spacing.xs
             bottomPadding: Style.spacing.xs
 
-            TextField {
+            // A TextArea (TextEdit-derived), not a TextField: Qt 6.12's
+            // TextInput canPaste path reads the full clipboard text on every
+            // clipboard change — an unsolicited, unbounded Wayland read in the
+            // shared shell — while TextEdit-derived controls check offered
+            // formats only. Return and paste below keep the query single-line.
+            QQC.TextArea {
               id: searchField
               width: parent.width
               height: Style.space(38)
               text: root.query
               placeholderText: "Search"
-              foreground: root.foreground
-              accent: root.xAccent
+              wrapMode: QQC.TextArea.NoWrap
+              clip: true
+              color: root.foreground
+              selectionColor: Style.selectionFillFor(root.foreground, root.xAccent)
+              selectedTextColor: root.foreground
               // X explore-style pill: icon sits ~16px from the left edge, then a
               // ~16px icon and ~12px gap before the text; ~16px right padding.
               leftPadding: Style.space(44)
@@ -1094,14 +1102,36 @@ Panel {
               // textEdited fires only for user input, so the programmatic
               // assignment on a dropdown-row click leaves the dismissal flag set.
               onTextEdited: root.suggestionsDismissed = false
+              // Paste runs on the explicit gesture only (nothing is read on
+              // clipboard changes); the text is flattened, trimmed, and
+              // capped at 256 code units so the query stays single-line.
+              function pasteSingleLine() {
+                let flat = (Quickshell.clipboardText || "").replace(/\s+/g, " ").trim().slice(0, 256)
+                const tail = flat.charCodeAt(flat.length - 1)
+                if (tail >= 0xD800 && tail <= 0xDBFF) flat = flat.slice(0, -1)
+                if (flat === "") return
+                const from = Math.min(selectionStart, selectionEnd)
+                remove(from, Math.max(selectionStart, selectionEnd))
+                insert(from, flat)
+                cursorPosition = from + flat.length
+                root.suggestionsDismissed = false
+              }
               // Arrow-key navigation is gated on results being present; the
               // clear button below empties the field.
               Keys.priority: Keys.BeforeItem
               Keys.onPressed: (event) => {
+                if (event.matches(StandardKey.Paste)) {
+                  searchField.pasteSingleLine()
+                  event.accepted = true
+                  return
+                }
                 if (resultModel.count === 0) return
                 if (event.key === Qt.Key_Down) { root.moveSelection(1); event.accepted = true }
                 else if (event.key === Qt.Key_Up) { root.moveSelection(-1); event.accepted = true }
               }
+              // Single line: Return/Enter never insert a newline (IME commits pass through).
+              Keys.onReturnPressed: (event) => { if (!searchField.inputMethodComposing) event.accepted = true }
+              Keys.onEnterPressed: (event) => { if (!searchField.inputMethodComposing) event.accepted = true }
               Keys.onEscapePressed: {
                 searchField.focus = false
                 keyCatcher.forceActiveFocus()
