@@ -242,8 +242,12 @@ module DHHFetch
         request['User-Agent'] = user_agent if user_agent
         request['Accept'] = accept if accept
         http.request(request) do |response|
+          # Read EVERY response's body under the cap: net/http drains a body
+          # left unread after this block, uncapped (`reading_body`'s `self.body`),
+          # so a hostile redirect/error body would otherwise be consumed whole.
+          body = read_capped_body(response, max_bytes: max_bytes)
           if response.is_a?(Net::HTTPSuccess)
-            result = yield(read_capped_body(response, max_bytes: max_bytes), response['content-type'])
+            result = yield(body, response['content-type'])
           elsif response.is_a?(Net::HTTPRedirection)
             redirects += 1
             next if redirects > MAX_REDIRECTS
