@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# The whole check suite; exits non-zero on the first failure.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+step() { printf '\n== %s\n' "$*"; }
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+# Tracked plus untracked files, minus ignored ones, so a moved or new file
+# cannot drop out of the suite. In a git pathspec `*` also matches `/`, so
+# 'lib/*.rb' includes lib/dhh/*.rb.
+files() { git ls-files --cached --others --exclude-standard -- "$@"; }
+
+# The exact first line of every helper and tool: run the system ruby with the
+# interpreter environment cleared, so RUBYOPT and friends cannot inject code.
+HARDENED_SHEBANG='#!/usr/bin/env -S -u RUBYOPT -u RUBYLIB -u RUBYGEMS_GEMDEPS -u BUNDLE_GEMFILE -u BUNDLE_PATH -u BUNDLE_BIN_PATH -u GEM_HOME -u GEM_PATH /usr/bin/ruby'
+
+step "omarchy plugin validate"
+if command -v omarchy >/dev/null 2>&1; then
+  omarchy plugin validate .
+else
+  echo "skipped (omarchy not on PATH)"
+fi
+
+step "ruby -c"
+# One file per call: `ruby -c a b` checks only a and hands b to it as ARGV.
+for f in $(files 'lib/*.rb' 'helpers/*' 'tools/*' 'tests/ruby/*.rb'); do ruby -c "$f" >/dev/null; done
+echo "ok"
+
+step "node --check"
+for f in $(files 'js/*.mjs' 'dev/*.mjs' 'dev/*.js' 'tests/js/*.mjs'); do node --check "$f"; done
+echo "ok"
+
+step "qmllint"
+# The shell's modules import as `qs.*`, so qmllint needs an import root with a
+# `qs` directory pointing at the shell. Every qmldir is passed with -i: left
+# to find it itself, qmllint reports a singleton it lints in that directory
+# as "not declared as singleton in qmldir". The known-noise filter drops
+# qmllint's false positives on the shell's untyped QtObject style tokens.
+QMLLINT=/usr/lib/qt6/bin/qmllint
+SHELL_DIR="${OMARCHY_PATH:-/usr/share/omarchy}/shell"
+if [ -x "$QMLLINT" ] && [ -d "$SHELL_DIR" ]; then
+  import_root="$(mktemp -d)"
+  trap 'rm -rf "$import_root"' EXIT
+  ln -s "$SHELL_DIR" "$import_root/qs"
+  qmldirs=()
+  for d in $(files '*qmldir'); do qmldirs+=(-i "$d"); done
+  # shellcheck disable=SC2046
+  lint_output="$("$QMLLINT" -I "$import_root" "${qmldirs[@]}" $(files '*.qml') 2>&1 || true)"
+  problems="$(printf '%s\n' "$lint_output" | grep -E '^(Warning|Error)' | grep -v 'not found on type "QObject" \[missing-property\]' || true)"
+  if [ -n "$problems" ]; then
+    printf '%s\n' "$problems"
+    exit 1
+  fi
+  echo "ok"
+else
+  echo "skipped (qmllint or the shell is missing)"
+fi
+
+step "helpers and tools"
+for f in helpers/* tools/*; do
+  [ -x "$f" ] || fail "$f not executable"
+  head -1 "$f" | grep -qxF "$HARDENED_SHEBANG" || fail "$f lacks the hardened shebang"
+done
+echo "ok"
+
+step "ruby tests"
+for t in $(files 'tests/ruby/test_*.rb'); do ruby "$t"; done
+
+step "node tests"
+for t in $(files 'tests/js/test_*.mjs'); do node "$t"; done
+
+printf '\nall checks passed\n'

@@ -1,0 +1,71 @@
+#!/usr/bin/env -S -u RUBYOPT -u RUBYLIB -u RUBYGEMS_GEMDEPS -u BUNDLE_GEMFILE -u BUNDLE_PATH -u BUNDLE_BIN_PATH -u GEM_HOME -u GEM_PATH /usr/bin/ruby
+# Tool: builds one dataset line with its content-derived id; --write appends it.
+
+require_relative '../lib/dhh'
+
+module DHH
+  module AddEntry
+    VALUES = %w[type text source date title domain kind context-author context-handle
+                context-text context-date context-verified-type file].freeze
+    SWITCHES = %w[context-verified write].freeze
+    USAGE = <<~TEXT
+      usage: tools/add-entry --type <#{DHH::Dataset::ENTRY_TYPES.join('|')}> --text "..." --source URL
+               [--date YYYY-MM-DD] [--title ... --domain ...]
+               [--kind #{DHH::Dataset::POST_KINDS.join('|')} --context-author NAME --context-handle @handle
+                [--context-text "..."] [--context-date YYYY-MM-DD]
+                [--context-verified [--context-verified-type #{DHH::Dataset::VERIFIED_TYPES.join('|')}]]]
+               [--write [--file PATH]] [--help]
+
+      Print one dataset line (JSON) with its content-derived id. --title and
+      --domain are for type link; --kind and the --context-* flags are for
+      type post. --context-verified stamps context.verified = true;
+      --context-verified-type adds the badge variant.
+
+      Options:
+        --write       append the line to the dataset and sort it, instead of
+                      printing the line
+        --file PATH   the dataset --write appends to (default #{DHH::CLI::DEFAULT_DATASET})
+        --help        show this usage
+    TEXT
+
+    module_function
+
+    def run(argv)
+      options = DHH::CLI.parse(argv, values: VALUES, switches: SWITCHES, usage: USAGE)
+      DHH::CLI.usage_error('--file requires --write', USAGE) if options.key?('file') && !options.key?('write')
+      if !options.key?('kind') && options.keys.any? { |k| k.start_with?('context-') }
+        DHH::CLI.usage_error('--context-* flags require --kind', USAGE)
+      end
+
+      entry = build(options)
+      if options.key?('write')
+        dataset_path = DHH::CLI.dataset_path(options, must_exist: false)
+        DHH::Dataset.append(dataset_path, [entry])
+        warn "appended 1 entry to #{dataset_path} (sorted)"
+      else
+        $stdout.write(DHH::Dataset.line(entry))
+      end
+    end
+
+    # The entry the flags describe; aborts with every schema problem when it
+    # does not validate.
+    def build(options)
+      context = nil
+      if options.key?('kind')
+        context = DHH::Dataset.context(
+          author: options['context-author'], handle: options['context-handle'],
+          text: options['context-text'], date: options['context-date'],
+          verified: options.key?('context-verified'), verified_type: options['context-verified-type']
+        )
+      end
+      DHH::Dataset.entry(
+        type: options['type'], text: options['text'], source: options['source'], date: options['date'],
+        kind: options['kind'], context: context, title: options['title'], domain: options['domain']
+      )
+    rescue DHH::Dataset::InvalidEntry => e
+      abort(e.message)
+    end
+  end
+end
+
+DHH::AddEntry.run(ARGV) if $PROGRAM_NAME == __FILE__

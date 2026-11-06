@@ -1,0 +1,64 @@
+#!/usr/bin/env -S -u RUBYOPT -u RUBYLIB -u RUBYGEMS_GEMDEPS -u BUNDLE_GEMFILE -u BUNDLE_PATH -u BUNDLE_BIN_PATH -u GEM_HOME -u GEM_PATH /usr/bin/ruby
+# Helper: fetches context-author avatars and prints one JSON map of handle to data URI.
+
+require_relative '../lib/dhh'
+
+module DHH
+  module FetchAvatars
+    MAX_HANDLES = 64
+    # Batch-wide raw-byte budget: an avatar that would push the running total
+    # past this is discarded and the batch stops.
+    MAX_BATCH_BYTES = 2 * 1024 * 1024
+    BATCH_DEADLINE = 8
+    USAGE = <<~TEXT
+      usage: helpers/fetch-avatars [@HANDLE ...] [--help]
+
+      Fetch avatars from unavatar.io and print one JSON object mapping each handle
+      to a base64 data URI. Takes zero or more handles (one leading @ is
+      tolerated).
+
+      Each handle must match #{DHH::Avatars::HANDLE_PATTERN.inspect}. Invalid handles and
+      failed fetches are omitted from the output. At most #{MAX_HANDLES} handles, #{MAX_BATCH_BYTES}
+      total bytes and a wall-clock deadline of #{BATCH_DEADLINE}s are honored; fetches are
+      HTTPS-only and TLS-verified. Exit status is 1 only for usage errors, 0
+      otherwise.
+    TEXT
+
+    module_function
+
+    # handle -> data URI for a batch sharing one DHH::Deadline and one
+    # raw-byte budget. Fetching stops when either is exhausted. The keyword
+    # defaults are production's; the tests point base_url at a loopback
+    # server and shrink the caps.
+    def batch(handles, base_url: DHH::Avatars::BASE_URL, max_avatar_bytes: DHH::Avatars::MAX_AVATAR_BYTES,
+              max_batch_bytes: MAX_BATCH_BYTES, deadline: DHH::Deadline.after(BATCH_DEADLINE))
+      results = {}
+      bytes_used = 0
+
+      handles.each do |handle|
+        break if deadline.expired? || bytes_used >= max_batch_bytes
+
+        fetched = DHH::Avatars.fetch(handle, deadline: deadline, base_url: base_url, max_avatar_bytes: max_avatar_bytes)
+        next unless fetched
+        # The size is unknowable before the download; an overflowing avatar is
+        # discarded and the batch ends.
+        break if bytes_used + fetched[:bytes] > max_batch_bytes
+
+        bytes_used += fetched[:bytes]
+        results[handle] = fetched[:data_uri]
+      end
+
+      results
+    end
+
+    def run(argv)
+      handles = DHH::CLI.parse(argv, usage: USAGE, positional: true)['args']
+      DHH::CLI.usage_error("too many handles: #{handles.length} (max #{MAX_HANDLES})", USAGE) if handles.length > MAX_HANDLES
+
+      $stdout.binmode
+      $stdout.write("#{JSON.generate(batch(handles.map { |arg| arg.delete_prefix('@') }))}\n")
+    end
+  end
+end
+
+DHH::FetchAvatars.run(ARGV) if $PROGRAM_NAME == __FILE__

@@ -1,0 +1,51 @@
+#!/usr/bin/env -S -u RUBYOPT -u RUBYLIB -u RUBYGEMS_GEMDEPS -u BUNDLE_GEMFILE -u BUNDLE_PATH -u BUNDLE_BIN_PATH -u GEM_HOME -u GEM_PATH /usr/bin/ruby
+# Helper: prints DHH's live number of X posts as one integer line.
+
+require_relative '../lib/dhh'
+
+module DHH
+  module FetchPostCount
+    PROFILE_URI = (DHH::Fxtwitter::BASE_URI + DHH::Fxtwitter.profile_path).freeze
+    # Streaming cap: the panel reads one number out of this body, not a timeline.
+    MAX_BODY_BYTES = 64 * 1024
+    HTTP_TIMEOUT = 5
+    USAGE = <<~TEXT
+      usage: helpers/fetch-post-count [--help]
+
+      Fetch DHH's profile from #{PROFILE_URI} and print its post
+      count (user.statuses) as one integer line. Takes no arguments.
+
+      The body is capped at #{MAX_BODY_BYTES} bytes, each hop times out after #{HTTP_TIMEOUT}s,
+      and redirects are limited to #{DHH::HTTP::MAX_REDIRECTS} HTTPS-only hops. On any failure,
+      including a missing or non-integer count, a one-line diagnostic is
+      written to stderr and the exit status is 1.
+    TEXT
+
+    module_function
+
+    # The post count in a profile body: user.statuses when it is a
+    # non-negative integer, else nil.
+    def post_count(body)
+      count = JSON.parse(body).dig('user', 'statuses')
+      count.is_a?(Integer) && count >= 0 ? count : nil
+    rescue JSON::ParserError, TypeError, NoMethodError
+      nil
+    end
+
+    # `uri` is overridable so the tests can point it at a loopback server.
+    def run(argv, uri: PROFILE_URI)
+      DHH::CLI.parse(argv, usage: USAGE)
+
+      body = DHH::HTTP.get(uri, max_body_bytes: MAX_BODY_BYTES, timeout: HTTP_TIMEOUT,
+                                accept: DHH::Fxtwitter::ACCEPT)
+      abort('post count fetch failed') if body.nil?
+
+      count = post_count(body)
+      abort('profile has no integer user.statuses') if count.nil?
+
+      puts count
+    end
+  end
+end
+
+DHH::FetchPostCount.run(ARGV) if $PROGRAM_NAME == __FILE__

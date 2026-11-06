@@ -1,0 +1,9 @@
+AvatarCache 1.0 AvatarCache.qml
+Dataset 1.0 Dataset.qml
+singleton Desktop 1.0 Desktop.qml
+HelperProcess 1.0 HelperProcess.qml
+History 1.0 History.qml
+ImageFolder 1.0 ImageFolder.qml
+PersistedList 1.0 PersistedList.qml
+PostCount 1.0 PostCount.qml
+RecentSearches 1.0 RecentSearches.qml

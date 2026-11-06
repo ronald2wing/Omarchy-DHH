@@ -1,0 +1,42 @@
+#!/usr/bin/env -S -u RUBYOPT -u RUBYLIB -u RUBYGEMS_GEMDEPS -u BUNDLE_GEMFILE -u BUNDLE_PATH -u BUNDLE_BIN_PATH -u GEM_HOME -u GEM_PATH /usr/bin/ruby
+# Tool: reports whether the dataset is sorted; --check fails when it is not, --write sorts it.
+
+require_relative '../lib/dhh'
+
+module DHH
+  module SortDataset
+    USAGE = <<~TEXT
+      usage: tools/sort-dataset [--file PATH] [--check | --write] [--help]
+
+      Report whether a JSON Lines dataset is sorted: dated entries first (date
+      ascending, id tiebreak), undated entries last (id ascending). Lines are
+      reordered as-is; JSON is parsed only to read the sort keys, never
+      re-serialized.
+
+      Options:
+        --file PATH   the dataset (default #{DHH::CLI::DEFAULT_DATASET})
+        --check       exit 1 when the file is not sorted
+        --write       sort the file in place
+        --help        show this usage
+    TEXT
+
+    module_function
+
+    def run(argv)
+      options = DHH::CLI.parse(argv, values: %w[file], switches: %w[check write], usage: USAGE)
+      DHH::CLI.usage_error('use either --check or --write, not both', USAGE) if options.key?('check') && options.key?('write')
+      dataset_path = DHH::CLI.dataset_path(options, must_exist: true)
+
+      if options.key?('write')
+        puts DHH::Dataset.sort!(dataset_path) ? "sorted #{dataset_path}" : "#{dataset_path} already sorted"
+        return
+      end
+
+      sorted = DHH::Dataset.sorted?(dataset_path)
+      puts "#{dataset_path} is #{sorted ? '' : 'not '}sorted"
+      exit 1 if options.key?('check') && !sorted
+    end
+  end
+end
+
+DHH::SortDataset.run(ARGV) if $PROGRAM_NAME == __FILE__

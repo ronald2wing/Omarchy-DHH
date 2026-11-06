@@ -1,0 +1,354 @@
+#!/usr/bin/env -S -u RUBYOPT -u RUBYLIB -u RUBYGEMS_GEMDEPS -u BUNDLE_GEMFILE -u BUNDLE_PATH -u BUNDLE_BIN_PATH -u GEM_HOME -u GEM_PATH /usr/bin/ruby
+# Tool: imports DHH's new posts from api.fxtwitter.com as dataset lines; --write appends them.
+
+require_relative '../lib/dhh'
+require 'net/http'
+
+module DHH
+  module ImportPosts
+    # Statuses requested per page; the API returns its own page size anyway.
+    PAGE_SIZE = 100
+    # Per-request open/read seconds.
+    HTTP_TIMEOUT = 10
+    # Streaming cap for one response body. A statuses page is ~100-300 KiB;
+    # this only stops a runaway or hostile body.
+    MAX_BODY_BYTES = 8 * 1024 * 1024
+    # Runaway guard for the cursor walk: the measured full history walk to the
+    # tail is ~57 pages, so 200 is far past any legitimate depth and only
+    # catches a broken, non-terminating loop.
+    MAX_PAGES = 200
+    # Polite pause between pages; the endpoint has no rate-limit header, but a
+    # tiny delay keeps a deep walk from hammering it.
+    PAGE_DELAY = 0.25
+    # Per-page attempt budget. The endpoint throttle-404s sporadically (longest
+    # observed run: 3), so the budget exceeds that with headroom for a deep
+    # walk. Linear backoff (attempt * 1.0 s) is enough because the throttle
+    # is coarse and one sleep cycle (~1-3 s) clears it.
+    MAX_FETCH_ATTEMPTS = 5
+    FETCH_RETRY_BACKOFF = 1.0
+    # At the timeline tail the endpoint returns results: [] but keeps handing
+    # back a non-null cursor forever. One empty page could be a fluke
+    # mid-history, so this many empty pages in a row confirm the tail.
+    TAIL_EMPTY_PAGES = 3
+    DEFAULT_PAGES = 1
+    USAGE = <<~TEXT
+      usage: tools/import-posts [--pages N | --all] [--bare-replies] [--file PATH] [--write] [--help]
+
+      Fetch DHH's recent posts from api.fxtwitter.com and print dataset lines
+      (one JSON line each, oldest first) for every post not already in the
+      dataset. Dry run by default.
+
+      Endpoint: GET #{DHH::Fxtwitter::BASE_URI}#{DHH::Fxtwitter.statuses_path(PAGE_SIZE)}
+      (~21 statuses per page, newest first, plus a cursor for the next older
+      page)
+
+      Options:
+        --pages N       fetch at most N cursor pages (default #{DEFAULT_PAGES}). Pages with no
+                        new entries do not stop the walk; only the page limit,
+                        cursor exhaustion or the timeline tail do.
+        --all           walk the cursor to the timeline tail (up to a
+                        #{MAX_PAGES}-page safety cap). Transient page failures are
+                        tried up to #{MAX_FETCH_ATTEMPTS} times with backoff.
+        --bare-replies  skip the per-reply status fetch; reply context carries
+                        only the bare author/handle. Quote context is unaffected.
+        --file PATH     the dataset to dedupe against and write to (default
+                        #{DHH::CLI::DEFAULT_DATASET})
+        --write         append the new entries to the dataset and sort it, page
+                        by page, so an abort keeps every page already fetched;
+                        prints the number of new entries
+        --help          show this usage
+    TEXT
+
+    module_function
+
+    def run(argv, base_uri: DHH::Fxtwitter::BASE_URI)
+      options = DHH::CLI.parse(argv, values: %w[pages file], switches: %w[all bare-replies write], usage: USAGE)
+      pages = options.fetch('pages', DEFAULT_PAGES.to_s)
+      DHH::CLI.usage_error("--pages must be an integer, got #{pages.inspect}", USAGE) unless pages.match?(/\A\d+\z/)
+      max_pages = options['all'] ? MAX_PAGES : pages.to_i.clamp(1, MAX_PAGES)
+      dataset_path = DHH::CLI.dataset_path(options, must_exist: true)
+
+      import(dataset_path: dataset_path, max_pages: max_pages, bare_replies: options.key?('bare-replies'),
+             write: options.key?('write'), base_uri: base_uri)
+    end
+
+    # Walk the statuses cursor and collect every new entry. A page with
+    # results but no new entries does not stop the walk: dedup is idempotent
+    # and the cursor is monotonic. No with_replies: that surfaces other
+    # users' replies.
+    def import(dataset_path:, max_pages:, bare_replies:, write:, base_uri:)
+      # A status is new only when neither its content-derived id nor its
+      # status URL is in the dataset. New entries join the same tables, so
+      # later pages are deduped against every earlier page too.
+      known_ids = {}
+      known_sources = {}
+      DHH::Dataset.each_entry(dataset_path) do |entry|
+        known_ids[entry['id']] = true
+        known_sources[entry['source']] = true
+      end
+
+      new_entries = []
+      kind_counts = { 'standalone' => 0, 'reply' => 0, 'quote' => 0, 'repost' => 0 }
+      pages_fetched = 0
+      empty_pages = 0
+      total_results = 0
+      cursor = nil
+      parent_contexts = {}
+      http = connect(base_uri)
+
+      loop do
+        pages_fetched += 1
+        payload = fetch_page(http, DHH::Fxtwitter.statuses_path(PAGE_SIZE, cursor))
+        results = payload['results']
+        abort('unexpected response: no results array') unless results.is_a?(Array)
+
+        total_results += results.length
+        empty_pages = results.empty? ? empty_pages + 1 : 0
+
+        page_entries = []
+        results.each do |status|
+          entry = new_entry(http, status, known_ids, known_sources, parent_contexts, bare_replies: bare_replies)
+          next if entry.nil?
+
+          page_entries << entry
+          kind_counts[entry['kind'] || 'standalone'] += 1
+          known_ids[entry['id']] = true
+          known_sources[entry['source']] = true
+        end
+        # The API is newest first; each page is reversed so output and
+        # appends run oldest first. The sort after each append makes the file
+        # order right either way.
+        page_entries.reverse!
+        new_entries.unshift(*page_entries)
+
+        # Checkpoint: with --write each page lands in the file as soon as it
+        # is complete, so a later failure keeps every earlier page.
+        DHH::Dataset.append(dataset_path, page_entries) if write && !page_entries.empty?
+
+        next_cursor = payload['cursor'].is_a?(Hash) ? payload['cursor']['bottom'] : nil
+        break if last_page?(pages_fetched: pages_fetched, max_pages: max_pages,
+                            cursor: next_cursor, empty_pages: empty_pages)
+
+        cursor = next_cursor
+        sleep PAGE_DELAY
+      end
+
+      http.finish if http.started?
+
+      if write
+        puts new_entries.length
+      else
+        new_entries.each { |entry| $stdout.write(DHH::Dataset.line(entry)) }
+      end
+      warn summary(pages_fetched, total_results, new_entries.length, kind_counts, write)
+    end
+
+    # The dataset entry for one timeline status, or nil when it is not DHH's,
+    # carries no text, date or id, is already known, or would not validate
+    # (skipped with a warning). The id and source are checked before any
+    # request is made for the status (a reply's context fetch), so a re-run
+    # costs only the page fetches.
+    def new_entry(http, status, known_ids, known_sources, parent_contexts, bare_replies:)
+      return nil unless status.is_a?(Hash)
+
+      author = status['author']
+      by_dhh = author.is_a?(Hash) && author['screen_name'] == DHH::HANDLE
+      # A repost's top-level author is the ORIGINAL author, so reposts are
+      # recognized by reposted_by rather than by the author.
+      repost = status['reposted_by'].is_a?(Hash) && status['reposted_by']['screen_name'] == DHH::HANDLE
+      # Other authors' posts the timeline can surface.
+      return nil unless repost || by_dhh
+
+      # The only hard skip is a blank body; for a repost this is the original
+      # author's words.
+      text = status['text'].to_s.strip
+      return nil if text.empty?
+
+      timestamp = status['created_timestamp'].to_i
+      return nil if timestamp <= 0 # every imported entry carries a date
+
+      status_id = status['id'].to_s
+      return nil if status_id.empty?
+
+      # A repost's top-level id is the original post's id, and x.com resolves
+      # a status by its id, so the dhh-handle URL opens the same post as it
+      # appears in DHH's timeline.
+      source = "https://x.com/#{DHH::HANDLE}/status/#{status_id}"
+      return nil if known_ids.key?(DHH::Dataset.id_for(text)) || known_sources.key?(source)
+
+      # Precedence when a status matches several kinds: reply > quote >
+      # repost. A reply whose body embeds another post carries a `quote`
+      # object too, so reply must win; a repost cannot also be a reply or a
+      # quote because its author is not DHH.
+      reply = by_dhh && (!status['replying_to'].nil? || !status['replying_to_status'].nil?)
+      quote = by_dhh && status['quote'].is_a?(Hash)
+
+      kind = nil
+      context = nil
+      if reply
+        kind = 'reply'
+        context = reply_context(http, status, parent_contexts, bare_replies: bare_replies)
+      elsif quote
+        quoted = status['quote']
+        quoted_author = quoted['author']
+        # A quoted post that has since been deleted comes back as a
+        # `tombstone` with no author, so there is nothing to build a context
+        # from; it imports as a standalone post of DHH's own commentary.
+        if quoted_author.is_a?(Hash) && quoted_author['name'] && quoted_author['screen_name']
+          kind = 'quote'
+          context = context_from(quoted_author, quoted)
+        end
+      elsif repost
+        # Author and handle only, no context text or date: the bare-repost
+        # shape.
+        kind = 'repost'
+        context = context_from(author)
+      end
+      DHH::Dataset.entry(type: 'post', text: text, source: source, date: utc_date(timestamp), kind: kind, context: context)
+    rescue DHH::Dataset::InvalidEntry => e
+      warn("skipping #{source}: #{e.message}")
+      nil
+    end
+
+    # Is this page the last? Any of: the page limit (safety cap), an
+    # exhausted cursor (nil or empty bottom token: the API says "no more
+    # pages"), or an empty page that completes a run of TAIL_EMPTY_PAGES (the
+    # timeline tail; a page with results resets the run to zero).
+    def last_page?(pages_fetched:, max_pages:, cursor:, empty_pages:)
+      pages_fetched >= max_pages || cursor.to_s.empty? || empty_pages >= TAIL_EMPTY_PAGES
+    end
+
+    def utc_date(timestamp)
+      Time.at(timestamp).utc.strftime('%Y-%m-%d')
+    end
+
+    # The context for an API author object, plus, when the referenced `post`
+    # is given, its text and date (a blank body or a zero timestamp is left
+    # out). Raises DHH::Dataset::InvalidEntry when the author has no name or
+    # handle.
+    def context_from(author, post = nil)
+      post = {} unless post.is_a?(Hash)
+      timestamp = post['created_timestamp'].to_i
+      DHH::Dataset.context(author: author['name'].to_s, handle: "@#{author['screen_name']}",
+                           text: post['text'].to_s, date: timestamp.positive? ? utc_date(timestamp) : nil,
+                           **verification_of(author))
+    end
+
+    # The author's verification as the context stores it: verified only when
+    # the API says so, so "unverified" and "not fetched" read the same, and
+    # the badge variant only when it is one the schema knows.
+    def verification_of(author)
+      verification = author['verification']
+      return { verified: false, verified_type: nil } unless verification.is_a?(Hash) && verification['verified'] == true
+
+      type = verification['type']
+      { verified: true, verified_type: DHH::Dataset::VERIFIED_TYPES.include?(type) ? type : nil }
+    end
+
+    # A reply's context. The replied-to post (the parent) is fetched through
+    # the single-status endpoint ({code, message, tweet: {...}}), so the
+    # context can carry the parent author's name, handle, text and date.
+    # With bare_replies (--bare-replies) that fetch is skipped and the
+    # context holds only the replied-to handle, as author and handle. A
+    # failed fetch (deleted post, transport error, non-2xx) falls back to the
+    # same bare context, the shape a repost has. Contexts are cached by parent
+    # id, so several replies to one post cost one fetch.
+    def reply_context(http, status, parent_contexts, bare_replies: false)
+      replying_to = status['replying_to']
+      if replying_to.is_a?(Hash)
+        handle = replying_to['screen_name']
+        parent_id = replying_to['status']
+      else
+        handle = replying_to
+        parent_id = status['replying_to_status']
+      end
+
+      bare_author = { 'name' => handle.to_s, 'screen_name' => handle.to_s }
+      return context_from(bare_author) if parent_id.to_s.empty?
+
+      key = parent_id.to_s
+      return parent_contexts[key] if parent_contexts.key?(key)
+      return context_from(bare_author) if bare_replies
+
+      parent = begin
+        fetch_json(http, DHH::Fxtwitter.status_path(parent_id))['tweet']
+      rescue RuntimeError
+        nil
+      end
+
+      parent_author = parent.is_a?(Hash) ? parent['author'] : nil
+      found = parent_author.is_a?(Hash) && parent_author['screen_name']
+      parent_contexts[key] = found ? context_from(parent_author, parent) : context_from(bare_author)
+    end
+
+    # One persistent connection for the whole run: every request (statuses
+    # pages and reply parents) reuses one TLS session instead of
+    # re-handshaking. Net::HTTP reconnects by itself when the server closes
+    # the connection.
+    def connect(base_uri)
+      Net::HTTP.start(base_uri.host, base_uri.port, use_ssl: base_uri.scheme == 'https',
+                                                    open_timeout: HTTP_TIMEOUT, read_timeout: HTTP_TIMEOUT)
+    rescue StandardError => e
+      abort("fetch failed: #{e.class}: #{e.message}")
+    end
+
+    # One statuses page, retried with linear backoff; aborts once the attempt
+    # budget is spent.
+    def fetch_page(http, path)
+      attempt = 0
+      begin
+        attempt += 1
+        fetch_json(http, path)
+      rescue RuntimeError => e
+        abort(e.message) if attempt >= MAX_FETCH_ATTEMPTS
+
+        warn("fetch failed (attempt #{attempt}/#{MAX_FETCH_ATTEMPTS}): #{e.message}, retrying...")
+        sleep FETCH_RETRY_BACKOFF * attempt
+        retry
+      end
+    end
+
+    # GET a JSON document over the shared connection, the body capped at
+    # MAX_BODY_BYTES. Raises RuntimeError on a transport failure, an
+    # oversized body, a non-2xx status or malformed JSON, so each caller
+    # decides whether to retry and abort (a page) or fall back (a reply's
+    # parent).
+    def fetch_json(http, path)
+      body = nil
+      response = begin
+        http.request(DHH::HTTP.request(path, accept: DHH::Fxtwitter::ACCEPT)) do |res|
+          body = DHH::HTTP.read_capped_body(res, max_body_bytes: MAX_BODY_BYTES)
+        end
+      rescue DHH::HTTP::BodyTooLarge
+        raise "GET #{path} failed: body over #{MAX_BODY_BYTES} bytes"
+      rescue StandardError => e
+        raise "fetch failed: #{e.class}: #{e.message}"
+      end
+      raise "GET #{path} failed: HTTP #{response.code} #{response.message}" unless response.is_a?(Net::HTTPSuccess)
+
+      begin
+        JSON.parse(body)
+      rescue JSON::ParserError => e
+        raise "GET #{path} failed: invalid JSON: #{e.message}"
+      end
+    end
+
+    def summary(pages_fetched, total_results, new_count, kind_counts, write)
+      line = "fetched #{pages_fetched} #{pages_fetched == 1 ? 'page' : 'pages'}, #{total_results} results, #{new_count} new"
+      line += if !write
+                ' (dry run)'
+              elsif new_count.zero?
+                ' (no new entries, nothing appended)'
+              else
+                ' (appended, sorted)'
+              end
+      breakdown = kind_counts.filter_map { |kind, count| "#{count} #{kind}" if count.positive? }
+      line += " [#{breakdown.join(', ')}]" unless breakdown.empty?
+      line
+    end
+
+    private_class_method :verification_of
+  end
+end
+
+DHH::ImportPosts.run(ARGV) if $PROGRAM_NAME == __FILE__

@@ -1,70 +1,42 @@
+pragma ComponentBehavior: Bound
 import QtQuick
-import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "model"
+import "ui/base"
+import "ui/panel"
 
-// DHH glyph in the bar. Service.qml stays mounted with the bar but the dataset
-// is read lazily on first panel open, so the glyph/status/IPC work without it.
-// Click/IPC contract matches the Bible widget.
-BarWidget {
+// Entry point: the bar glyph and the panel host; creates and wires the model objects.
+Panel {
   id: root
   moduleName: "dhh"
-
-  Service {
-    id: service
-  }
-
-  readonly property color barForeground: bar ? bar.barForeground : Color.foreground
-
-  function open() {
-    if (panelLoader.item) panelLoader.item.open()
-  }
-
-  function close() {
-    if (panelLoader.item) panelLoader.item.close()
-  }
-
-  function togglePanel() {
-    if (panelLoader.item) panelLoader.item.toggle()
-  }
-
-  function injectPanel() {
-    const target = panelLoader.item
-    if (!target) return
-    if ("bar" in target) target.bar = root.bar
-    if ("anchorItem" in target) target.anchorItem = button
-    if ("hostWidget" in target) target.hostWidget = root
-    if ("service" in target) target.service = service
-  }
+  // The Panel owns the open state (`opened`) and this IPC target:
+  // open/close/show/hide/toggle.
+  ipcTarget: "dhh"
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  onBarChanged: injectPanel()
+  // The model objects live here, not in the panel body (built on the first
+  // open), so their state loads with the bar and outlives the panel's
+  // visibility. Each one that works on open binds `active` to the open state
+  // and starts or cancels that work itself.
+  //
+  // Held in properties rather than ids: an id named like PanelBody's
+  // matching property shadows it (qmllint's id-shadows-member).
+  readonly property Dataset dataset: Dataset { active: root.opened }
+  readonly property History history: History { dataset: root.dataset }
+  readonly property RecentSearches recentSearches: RecentSearches {}
+  readonly property PostCount postCount: PostCount { active: root.opened }
+  readonly property AvatarCache avatars: AvatarCache { active: root.opened; requestOnOpen: root.history.entries }
+  readonly property ImageFolder imageFolder: ImageFolder {}
 
-  Loader {
-    id: panelLoader
-    active: true
-    source: Qt.resolvedUrl("Panel.qml")
-    visible: false
-    onLoaded: {
-      root.injectPanel()
-      // Deferred second call: panel properties may not all be ready on the
-      // first inject; this guards the injection-timing race after Loader loads.
-      Qt.callLater(root.injectPanel)
-    }
-  }
-
-  IpcHandler {
-    target: "dhh"
-
-    function open(): void { root.open() }
-    function close(): void { root.close() }
-    function show(): void { root.open() }
-    function hide(): void { root.close() }
-    function togglePanel(): void { root.togglePanel() }
-    function status(): string { return "DHH" }
-  }
+  // Look is one singleton for every monitor's instance; each writes the same
+  // value (Panel.barForeground is the bar's, else Color.foreground).
+  // Assigned rather than bound, so a monitor going away does not restore an
+  // old value the way a destroyed Binding would.
+  Component.onCompleted: Look.barForeground = root.barForeground
+  onBarForegroundChanged: Look.barForeground = root.barForeground
 
   BarIconButton {
     id: button
@@ -75,17 +47,43 @@ BarWidget {
     iconComponent: Component {
       Image {
         anchors.centerIn: parent
-        width: Style.font.body * 448 / 512
+        // The glyph's drawn size: the square SVG fits this width, 7/8 of the
+        // body font size.
+        width: Style.font.body * 7 / 8
         height: Style.font.body
-        source: Qt.resolvedUrl("data/icon-matrix.svg")
+        source: Look.icon("bar-glyph")
         sourceSize: Qt.size(24, 24)
         fillMode: Image.PreserveAspectFit
         smooth: true
       }
     }
+    onPressed: (mouseButton) => { if (mouseButton === Qt.LeftButton) root.toggle() }
+  }
 
-    onPressed: (b) => {
-      if (b === Qt.LeftButton) root.togglePanel()
+  KeyboardPanel {
+    id: keyboardPanel
+    padding: 0
+    anchorItem: button
+    owner: root
+    bar: root.bar
+    open: root.opened
+    focusTarget: keyboardPanel.loadedContent
+    contentWidth: keyboardPanel.fittedContentWidth(Look.columnWidth)
+    contentHeight: keyboardPanel.fittedContentHeight(keyboardPanel.loadedContentHeight, Style.space(640))
+    borderSpec: Border.flat(Look.divider, Look.panelBorderWidth)
+
+    content: Component {
+      PanelBody {
+        dataset: root.dataset
+        history: root.history
+        recentSearches: root.recentSearches
+        postCount: root.postCount
+        avatars: root.avatars
+        imageFolder: root.imageFolder
+        opened: root.opened
+        onCloseRequested: root.close()
+        onTabRequested: (direction) => root.switchPanel(direction)
+      }
     }
   }
 }

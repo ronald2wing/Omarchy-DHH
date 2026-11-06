@@ -1,0 +1,9 @@
+singleton Look 1.0 Look.qml
+XText 1.0 XText.qml
+SecondaryText 1.0 SecondaryText.qml
+Divider 1.0 Divider.qml
+Icon 1.0 Icon.qml
+Avatar 1.0 Avatar.qml
+VerifiedBadge 1.0 VerifiedBadge.qml
+DiscButton 1.0 DiscButton.qml
+PillButton 1.0 PillButton.qml
